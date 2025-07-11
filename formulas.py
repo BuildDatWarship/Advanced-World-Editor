@@ -19,7 +19,7 @@
 # All parameters from the UI are also available (e.g., uplift_magnitude, lapse_rate_c_per_1000m, etc.)
 
 DEFAULT_FORMULAS = {
-    "heightmap_formula": "(cm + (tsm * uplift_magnitude) + (rm * tsm * ridge_strength) + (bn * tsm * boundary_jaggedness))+ (sc*0.65)",
+    "heightmap_formula": "(cm + (tsm * uplift_magnitude) + (rm * tsm * ridge_strength) + (bn * tsm * boundary_jaggedness))",
 
     "temperature_base_k_formula": "((1 - albedo_mean) * solar_intensity * (1/pi) / stefan_boltzmann)**0.25",
     
