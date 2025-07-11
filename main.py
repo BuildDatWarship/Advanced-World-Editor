@@ -1131,6 +1131,19 @@ class MapGeneratorApp:
                       print(f"Error applying final temperature blur: {e}")
                       # Continue without blur if it fails
 
+            # Recalculate river deposition with temperature constraints
+            self.status_var.set("Simulating climate (3.7/5): Updating Rivers..."); self.root.update_idletasks()
+            river_deposition_data = gen.calculate_river_deposition(
+                 hmap,
+                 flow_angles,
+                 params,
+                 self.scaling_manager,
+                 self.last_gen_data['temperature_map']
+            )
+            river_deposition_map = river_deposition_data['deposition_map']
+            self.last_gen_data['river_deposition_map'] = river_deposition_map
+            self.last_gen_data.setdefault("diagnostic_maps", {}).update(river_deposition_data.get("diagnostics", {}))
+
 
             # Step 4: Calculate Rainfall Map (NEW LOGIC)
             self.status_var.set("Simulating climate (4/5): Calculating Rainfall..."); self.root.update_idletasks()
@@ -1515,7 +1528,13 @@ class MapGeneratorApp:
 
         # Recalculate deposition based on current hmap and flow angles using *current* UI parameters
         # Pass a dictionary of current parameter values
-        river_deposition_data = gen.calculate_river_deposition(hmap, flow_angles, {k: v.get() for k, v in self.vars.items()})
+        river_deposition_data = gen.calculate_river_deposition(
+            hmap,
+            flow_angles,
+            {k: v.get() for k, v in self.vars.items()},
+            self.scaling_manager,
+            self.last_gen_data.get("temperature_map")
+        )
         river_deposition_map = river_deposition_data['deposition_map']
         # Store the newly calculated deposition map
         self.last_gen_data['river_deposition_map'] = river_deposition_map
@@ -1654,7 +1673,7 @@ class MapGeneratorApp:
         # Puts result or exception into the queue q
         try:
             # generate_world_data now calculates base maps, flow angles, and river deposition map
-            world_data = gen.generate_world_data(params)
+            world_data = gen.generate_world_data(params, self.scaling_manager)
             q.put(world_data) # Put the successful result into the queue
         except Exception as e:
             # Catch any exceptions during generation and put them into the queue
