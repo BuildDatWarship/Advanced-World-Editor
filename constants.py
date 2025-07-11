@@ -5,12 +5,15 @@ STEFAN_BOLTZMANN = 5.670374419e-8
 KELVIN_TO_CELSIUS_OFFSET = 273.15
 SEA_LEVEL = 0.4  # Default normalized sea level
 
-# Multiplier for precipitation processes based on the Clausius-Clapeyron
-# relation.  Takes a temperature in Celsius and returns a factor
-# max(0, 1 + 0.07 * (temp_c - 15)).  Used to scale rainfall blur radius and
-# intensity so warmer areas spread moisture further and receive more rain.
+import numpy as np
+
+# relation.  Takes a temperature in Celsius (scalar or array) and returns an
+# element-wise factor `max(0, 1 + 0.07 * (temp_c - 15))`.  Used to scale rainfall
+# blur radius and intensity so warmer areas spread moisture further and receive
+# more rain.
 def cc_rainfall_multiplier(temp_c): 
-    return max(0.0, 1.0 + 0.07 * (temp_c - 15.0))
+    temp_c = np.asarray(temp_c, dtype=np.float32)
+    return np.maximum(0.0, 1.0 + 0.07 * (temp_c - 15.0))
 
 # --- FIX: Overhauled biome definitions for better coverage and more realistic distribution ---
 # The order is important: more specific biomes are checked first.
