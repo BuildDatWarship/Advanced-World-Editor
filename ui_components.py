@@ -46,7 +46,12 @@ class ZoomableCanvas(tk.Canvas):
         box_x2 = box_x1 + canvas_w / self.zoom_level
         box_y2 = box_y1 + canvas_h / self.zoom_level
         cropped_image = self.pil_image.crop((box_x1, box_y1, box_x2, box_y2))
-        resized_image = cropped_image.resize((canvas_w, canvas_h), Image.Resampling.NEAREST)
+        # Use high-quality resampling to avoid aliasing artifacts that look like
+        # a black/white checkerboard when displaying large images at small
+        # scales.
+        resized_image = cropped_image.resize(
+            (canvas_w, canvas_h), Image.Resampling.LANCZOS
+        )
         self.tk_image = ImageTk.PhotoImage(resized_image)
         if self.image_id:
             self.itemconfig(self.image_id, image=self.tk_image)
