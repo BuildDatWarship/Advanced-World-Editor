@@ -124,7 +124,8 @@ def calculate_flow_field(hmap, params):
     # Blend wind and contour flow - more steepness means more contour-aligned flow
     final_vx = vx_wind * (1 - steepness) + vx_contour * steepness
     final_vy = vy_wind * (1 - steepness) + vy_contour * steepness
-    flow_field_angles = np.arctan2(final_vy, final_vy) # Recompute angle from final vectors
+    # Use both vector components when computing the final angle
+    flow_field_angles = np.arctan2(final_vy, final_vx)
     return flow_field_angles # This function should still exist
 
 # --- Update the Numba function to handle spawning and clipping ---
@@ -247,8 +248,18 @@ def generate_flow_field_rivers(hmap, params):
     h, w = hmap.shape
     sea_level = params.get('sea_level', 0.4)
     flow_field_angles = calculate_flow_field(hmap, params)
-    deposition_map = _run_river_simulation_numba(flow_field_angles, params["particle_count"], params["particle_steps"], params["particle_fade"], params["particle_steps"] // 2, 1.0)
-    
+    # Correct parameter order for the numba simulation helper
+    deposition_map = _run_river_simulation_numba(
+        hmap,
+        sea_level,
+        flow_field_angles,
+        params["particle_count"],
+        params["particle_steps"],
+        params["particle_fade"],
+        params["particle_steps"] // 2,
+        1.0,
+    )
+       
     processed_deposition = np.power(normalize_map(deposition_map), 0.7)
     
     # Create a land mask to clip rivers from appearing in water
