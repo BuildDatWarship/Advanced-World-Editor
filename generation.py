@@ -693,7 +693,7 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     else:
          # Normalize raw deposition map first for consistent scaling
          normalized_raw_deposition = normalize_map(river_deposition_map)
-         normalized_raw_deposition[normalized_raw_deposition > 0.1] = (1/0.35)
+         normalized_raw_deposition[normalized_raw_deposition > 0.01] = (1/0.35)
          # River blur sigma is 1/3rd of the sea blur sigma
          river_blur_sigma_pixels = sea_blur_sigma_pixels / 3.0
          river_blur_sigma_pixels = max(0.1, river_blur_sigma_pixels) * sigma_factor
