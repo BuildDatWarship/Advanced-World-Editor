@@ -40,6 +40,7 @@ class MapGeneratorApp:
             "plate_points": tk.IntVar(value=12),
             "uplift_magnitude": tk.DoubleVar(value=0.6),
             "tectonic_smoothing": tk.DoubleVar(value=3.0),
+            "hypsometric_strength": tk.DoubleVar(value=1.0),
             "ridge_strength": tk.DoubleVar(value=0.4),
             "ridge_scale": tk.DoubleVar(value=60.0),
             "ridge_octaves": tk.IntVar(value=6),
@@ -902,6 +903,7 @@ class MapGeneratorApp:
         self.create_control_slider(lf_tec, "Plate Count:", self.vars["plate_points"], 4, 50, "Plate Count", True)
         self.create_control_slider(lf_tec, "Uplift:", self.vars["uplift_magnitude"], 0.0, 2.0, "Tectonic Uplift")
         self.create_control_slider(lf_tec, "Smoothing:", self.vars["tectonic_smoothing"], 0.0, 10.0, "Tectonic Smoothing")
+        self.create_control_slider(lf_tec, "Hypsometry:", self.vars["hypsometric_strength"], 0.5, 1.5, "Hypsometric Strength")
         self.create_control_slider(lf_tec, "Ridge Str:", self.vars["ridge_strength"], 0.0, 1.5, "Ridge Strength")
         self.create_control_slider(lf_tec, "Ridge Scale:", self.vars["ridge_scale"], 10.0, 200.0, "Ridge Scale")
         self.create_control_slider(lf_tec, "Ridge Detail:", self.vars["ridge_octaves"], 1, 8, "Ridge Detail", True)

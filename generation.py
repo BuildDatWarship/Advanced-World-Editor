@@ -3,10 +3,20 @@ import noise
 from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter, label, map_coordinates, distance_transform_edt
+from scipy.fft import fft2, ifft2, fftshift
 import numba
 from asteval import Interpreter as AstevalInterpreter # Use safe interpreter
 
 from constants import STEFAN_BOLTZMANN, KELVIN_TO_CELSIUS_OFFSET, cc_rainfall_multiplier
+
+EARTHLIKE_CDF = np.array([
+    (0.00, 0.0),        # deepest trench
+    (0.71, 0.31234),    # abyssal peak
+    (0.71, 0.55164),    # shelf break
+    (0.97, 0.59446),    # continental mean
+    (0.997, 0.65390),   # 3% above 2 km
+    (1.00, 1.0),        # Everest
+], dtype=np.float32)
 
 # --- Helper functions specific to generation ---
 # ---------- OpenSimplex (or Perlin) helpers: paste this block ----------
@@ -63,20 +73,37 @@ def normalize_map(d):
 # --- Vectorized Wrappers for the 'noise' library ---
 vec_pnoise2 = np.vectorize(noise.pnoise2)
 
-# --- Heightmap smoothing near tectonic boundaries ---
-def tectonic_smooth(height, plate_mask, sigma_core=1.0, sigma_interior=10.0, blend_dist=150):
-    """Apply a blur that transitions from `sigma_core` near plate boundaries
-    to `sigma_interior` deeper inside a plate."""
-    # Distance from each pixel to the nearest boundary pixel
-    dist = distance_transform_edt(1 - plate_mask)
+# --- Heightmap shaping based on tectonic distance and Earth-like statistics ---
+def earthlike(height, plate_mask, world_diameter_km, cdf_factor=1.0,
+              spectral_slope=-2.0, sigma_edge=1.0, sigma_core=12.0, blend_km=250.0,
+              target_cdf=EARTHLIKE_CDF):
+    """Smooth heightmap interiors and remap elevations to an Earth-like CDF."""
+    dist_px = distance_transform_edt(1 - plate_mask)
+    km_per_px = world_diameter_km / height.shape[1] if height.shape[1] else 1.0
+    w = np.clip(dist_px * km_per_px / blend_km, 0, 1)
+    h_edge = gaussian_filter(height, sigma_edge / km_per_px)
+    h_core = gaussian_filter(height, sigma_core / km_per_px)
+    blurred = (1 - w) * h_edge + w * h_core
+
+    H, W = blurred.shape
+    kx = fftshift(np.fft.fftfreq(W))[:, None]
+    ky = fftshift(np.fft.fftfreq(H))[None, :]
+    k = np.sqrt(kx ** 2 + ky ** 2) + 1e-9
+    spec = fft2(blurred)
+    spec *= k ** (spectral_slope / 2.0)
+    shaped = np.real(ifft2(spec))
 
     # Two differently blurred versions of the height field
-    h_core = gaussian_filter(height, sigma_core)
-    h_interior = gaussian_filter(height, sigma_interior)
+    if target_cdf is not None:
+        flat = shaped.ravel()
+        ranks = np.argsort(np.argsort(flat))
+        cdf_pos = ranks / float(flat.size - 1)
+        flat = np.interp(cdf_pos, target_cdf[:, 0], target_cdf[:, 1])
+        shaped = flat.reshape(shaped.shape)
 
     # Blend weight ramps from 0 at the boundary to 1 in the interior
-    w = np.clip(dist / blend_dist, 0, 1)
-    return (1 - w) * h_core + w * h_interior
+    shaped = 0.5 + cdf_factor * (shaped - 0.5)
+    return np.clip(shaped, 0.0, 1.0)
 
 # --- Generation Algorithms ---
 def generate_perlin_noise(w, h, scale, octaves, seed):
@@ -338,8 +365,14 @@ def generate_world_data(params, scaling_manager):
 
         diagnostic_maps["6_raw_combined_heightmap"] = hm.copy()
         final_map = normalize_map(hm)
-        final_map = tectonic_smooth(final_map, plate_mask)
-        diagnostic_maps["6b_plate_smoothed_heightmap"] = final_map.copy()
+        final_map = earthlike(
+            final_map,
+            plate_mask,
+            params.get("world_diameter_km", 12000),
+            params.get("hypsometric_strength", 1.0),
+        )
+        diagnostic_maps["6b_earthlike_heightmap"] = final_map.copy()
+
 
 
         # --- Calculate Base Flow Field (used for rivers and rain shadow) ---
