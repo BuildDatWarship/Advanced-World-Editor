@@ -2,7 +2,7 @@ import numpy as np
 import noise
 from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
-from scipy.ndimage import gaussian_filter, label, map_coordinates
+from scipy.ndimage import gaussian_filter, label, map_coordinates, distance_transform_edt
 import numba
 from asteval import Interpreter as AstevalInterpreter # Use safe interpreter
 
@@ -63,6 +63,21 @@ def normalize_map(d):
 # --- Vectorized Wrappers for the 'noise' library ---
 vec_pnoise2 = np.vectorize(noise.pnoise2)
 
+# --- Heightmap smoothing near tectonic boundaries ---
+def tectonic_smooth(height, plate_mask, sigma_core=1.0, sigma_interior=10.0, blend_dist=150):
+    """Apply a blur that transitions from `sigma_core` near plate boundaries
+    to `sigma_interior` deeper inside a plate."""
+    # Distance from each pixel to the nearest boundary pixel
+    dist = distance_transform_edt(1 - plate_mask)
+
+    # Two differently blurred versions of the height field
+    h_core = gaussian_filter(height, sigma_core)
+    h_interior = gaussian_filter(height, sigma_interior)
+
+    # Blend weight ramps from 0 at the boundary to 1 in the interior
+    w = np.clip(dist / blend_dist, 0, 1)
+    return (1 - w) * h_core + w * h_interior
+
 # --- Generation Algorithms ---
 def generate_perlin_noise(w, h, scale, octaves, seed):
     x, y = np.arange(w), np.arange(h)
@@ -100,6 +115,7 @@ def generate_tectonic_map(w, h, num_plates, seed):
             if norm > 1e-9:
                 boundary_normal = (points[j] - points[i]) / norm
                 plate_potentials[i] -= np.dot(v_rel, boundary_normal)
+
     yi, xi = np.indices((h, w))
     pixel_coords = np.stack((xi.ravel(), yi.ravel()), axis=-1)
     dist, indices = tree.query(pixel_coords, k=2)
@@ -108,7 +124,17 @@ def generate_tectonic_map(w, h, num_plates, seed):
     epsilon = 1e-6
     w1, w2 = 1 / (d1**2 + epsilon), 1 / (d2**2 + epsilon)
     tectonic_map = (p1 * w1 + p2 * w2) / (w1 + w2)
-    return normalize_map(tectonic_map.reshape(h, w)), points, velocities
+
+    # Create a boundary mask by checking neighbouring plate indices
+    nearest = indices[:, 0].reshape(h, w)
+    plate_mask = np.zeros((h, w), dtype=np.uint8)
+    plate_mask[1:, :] |= nearest[1:, :] != nearest[:-1, :]
+    plate_mask[:, 1:] |= nearest[:, 1:] != nearest[:, :-1]
+    plate_mask[:-1, :] |= nearest[:-1, :] != nearest[1:, :]
+    plate_mask[:, :-1] |= nearest[:, :-1] != nearest[:, 1:]
+
+    return normalize_map(tectonic_map.reshape(h, w)), points, velocities, plate_mask
+
 
 def calculate_flow_field(hmap, params):
     h, w = hmap.shape
@@ -259,7 +285,7 @@ def generate_flow_field_rivers(hmap, params):
         params["particle_steps"] // 2,
         1.0,
     )
-       
+
     processed_deposition = np.power(normalize_map(deposition_map), 0.7)
     
     # Create a land mask to clip rivers from appearing in water
@@ -280,7 +306,8 @@ def generate_world_data(params):
         diagnostic_maps = {}
 
         # --- Generate Base Maps ---
-        tsm, pp, pv = generate_tectonic_map(w, h, params["plate_points"], ms)
+        tsm, pp, pv, plate_mask = generate_tectonic_map(w, h, params["plate_points"], ms)
+        diagnostic_maps["0_plate_mask"] = plate_mask.copy()
         diagnostic_maps["1_tectonic_potential"] = tsm.copy()
         if params["tectonic_smoothing"] > 0:
             tsm = gaussian_filter(tsm, sigma=params["tectonic_smoothing"])
@@ -306,6 +333,8 @@ def generate_world_data(params):
 
         diagnostic_maps["6_raw_combined_heightmap"] = hm.copy()
         final_map = normalize_map(hm)
+        final_map = tectonic_smooth(final_map, plate_mask)
+        diagnostic_maps["6b_plate_smoothed_heightmap"] = final_map.copy()
 
 
         # --- Calculate Base Flow Field (used for rivers and rain shadow) ---
@@ -329,6 +358,7 @@ def generate_world_data(params):
             "heightmap": final_map,
             "plate_points": pp,
             "plate_velocities": pv,
+            "plate_mask": plate_mask,
             "flow_angles": flow_angles, # Return base flow angles
             "river_deposition_map": river_deposition_map, # Return deposition map
             "biome_override_map": override,
@@ -529,7 +559,7 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     # 1. Calculate Sea Blur Sigma and blur the sea mask
     # Interpretation: Sigma is (135 km / World Diameter km) * Map Width (pixels)
     # This makes the pixel sigma scale with the map size for a constant 'real world' distance
-    sea_blur_sigma_km_base = 135.0
+    sea_blur_sigma_km_base = 200.0
     # Avoid division by zero if world_diameter_km is 0 or tiny
     sea_blur_sigma_pixels = (sea_blur_sigma_km_base / world_diameter_km) * w if world_diameter_km > 1e-9 and w > 0 else 1.0
     sea_blur_sigma_pixels = max(0.1, sea_blur_sigma_pixels) # Ensure minimum sigma
@@ -630,7 +660,7 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
          # Normalize raw deposition map first for consistent scaling
          normalized_raw_deposition = normalize_map(river_deposition_map)
          # River blur sigma is 1/3rd of the sea blur sigma
-         river_blur_sigma_pixels = sea_blur_sigma_pixels / 3.0
+         river_blur_sigma_pixels = sea_blur_sigma_pixels
          river_blur_sigma_pixels = max(0.1, river_blur_sigma_pixels) # Ensure minimum sigma
          # Apply Gaussian blur to normalized river deposition map
          # Use mode='wrap'
