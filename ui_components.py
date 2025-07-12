@@ -14,9 +14,13 @@ class ZoomableCanvas(tk.Canvas):
         self.pil_image = None
         self.tk_image = None
         self.image_id = None
+        self._offset_ratio_update = None
 
     def set_image(self, pil_image):
         self.pil_image = pil_image
+
+    def set_offset_update_callback(self, callback):
+        self._offset_ratio_update = callback
 
     def fit_to_screen(self):
         if not self.pil_image: return
@@ -70,6 +74,8 @@ class ZoomableCanvas(tk.Canvas):
         self.x_offset = min(max(self.x_offset, 0.0), max_x_off)
         self.y_offset = min(max(self.y_offset, 0.0), max_y_off)
         self.redraw()
+        if self._offset_ratio_update:
+            self._offset_ratio_update(self.get_x_offset_ratio())
 
     def zoom(self, event):
         if not self.pil_image: return
@@ -81,9 +87,28 @@ class ZoomableCanvas(tk.Canvas):
         self.x_offset += world_x_before - world_x_after
         self.y_offset += world_y_before - world_y_after
         self.redraw()
+        if self._offset_ratio_update:
+            self._offset_ratio_update(self.get_x_offset_ratio())
 
     def canvas_to_world(self, canvas_x, canvas_y):
         return (self.x_offset + canvas_x / self.zoom_level, self.y_offset + canvas_y / self.zoom_level)
+
+    def get_x_offset_ratio(self):
+        if not self.pil_image:
+            return 0.0
+        canvas_w = self.winfo_width()
+        img_w = self.pil_image.size[0]
+        max_x_off = max(0.0, img_w - canvas_w / self.zoom_level)
+        return self.x_offset / max_x_off if max_x_off > 1e-9 else 0.0
+
+    def set_x_offset_ratio(self, ratio):
+        if not self.pil_image:
+            return
+        canvas_w = self.winfo_width()
+        img_w = self.pil_image.size[0]
+        max_x_off = max(0.0, img_w - canvas_w / self.zoom_level)
+        self.x_offset = ratio * max_x_off
+        self.redraw()
 
 # --- TOOLTIP CLASS ---
 class Tooltip:

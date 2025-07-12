@@ -154,6 +154,12 @@ class MapGeneratorApp:
         canvas_frame.columnconfigure(0, weight=1)
         self.map_canvas = ZoomableCanvas(canvas_frame, background="#282828", highlightthickness=0)
         self.map_canvas.grid(row=0, column=0, sticky="nsew")
+        self.map_canvas.set_offset_update_callback(lambda r: self.scroll_x.set(r))
+        self.scroll_x = tk.DoubleVar(value=0.0)
+        self.scrollbar_x = ttk.Scale(canvas_frame, orient="horizontal", variable=self.scroll_x,
+                                     command=lambda v: self.map_canvas.set_x_offset_ratio(float(v)))
+        self.scrollbar_x.grid(row=1, column=0, sticky="ew")
+        canvas_frame.rowconfigure(1, weight=0)
 
         right_notebook = ttk.Notebook(main_pane)
         main_pane.add(right_notebook, weight=1)
@@ -367,7 +373,10 @@ class MapGeneratorApp:
         dx, dy = e.x - self.pan_last_x, e.y - self.pan_last_y
         self.map_canvas.pan(dx, dy)
         self.pan_last_x, self.pan_last_y = e.x, e.y
-    def on_zoom(self, e): self.map_canvas.zoom(e)
+        self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
+    def on_zoom(self, e):
+        self.map_canvas.zoom(e)
+        self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
     def on_paint_move(self, e):
         if self.is_painting:
             self._apply_brush(e)
@@ -1766,12 +1775,13 @@ class MapGeneratorApp:
         # Updates self.last_gen_data with image objects (_image, _layer, _tinted)
         # Calls update_display at the end
         if "heightmap" not in self.last_gen_data or self.last_gen_data["heightmap"] is None:
-             # No heightmap to base visuals on
-             self.status_var.set("No heightmap data to generate visuals.");
-             self.map_canvas.set_image(Image.new("RGBA", (512, 512), (0, 0, 0, 0))) # Set a blank image
-             self.map_canvas.fit_to_screen()
-             self._show_initial_message() # Show initial message
-             return # Cannot regenerate visuals without heightmap
+            # No heightmap to base visuals on
+            self.status_var.set("No heightmap data to generate visuals.")
+            self.map_canvas.set_image(Image.new("RGBA", (512, 512), (0, 0, 0, 0)))  # blank image
+            self.map_canvas.fit_to_screen()
+            self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
+            self._show_initial_message()  # Show initial message
+            return  # Cannot regenerate visuals without heightmap
 
         self.status_var.set("Regenerating visuals..."); # Update status bar
         self.root.update_idletasks() # Force UI update
@@ -1906,39 +1916,52 @@ class MapGeneratorApp:
         # --- Diagnostic Map Display ---
         # If diagnostic view is enabled and a diagnostic map image is available, display it directly
         if self.vars["show_diagnostic_map"].get():
-             selected_map_name = self.vars["selected_diagnostic_map"].get()
-             if selected_map_name in self.diagnostic_images and self.diagnostic_images[selected_map_name] is not None:
-                 diagnostic_image = self.diagnostic_images[selected_map_name]
-                 self.map_canvas.set_image(diagnostic_image)
-                 if is_new_generation: self.map_canvas.fit_to_screen()
-                 else: self.map_canvas.redraw()
+            selected_map_name = self.vars["selected_diagnostic_map"].get()
+            if (
+                selected_map_name in self.diagnostic_images
+                and self.diagnostic_images[selected_map_name] is not None
+            ):
+                diagnostic_image = self.diagnostic_images[selected_map_name]
+                self.map_canvas.set_image(diagnostic_image)
+                if is_new_generation:
+                    self.map_canvas.fit_to_screen()
+                    self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
+                else:
+                    self.map_canvas.redraw()
 
-                 # Update status bar with specific diagnostic value under cursor
-                 # This requires the raw data array for the diagnostic map
-                 diag_data_map = self.last_gen_data.get("diagnostic_maps", {}).get(selected_map_name)
-                 if diag_data_map is not None and diag_data_map.shape == self.last_gen_data["heightmap"].shape:
-                       # Get mouse position relative to canvas window
-                       mouse_x, mouse_y = self.root.winfo_pointerx() - self.map_canvas.winfo_rootx(), self.root.winfo_pointery() - self.map_canvas.winfo_rooty()
-                       # Convert canvas coordinates to world coordinates
-                       mx, my = self.map_canvas.canvas_to_world(mouse_x, mouse_y)
-                       h, w = self.last_gen_data["heightmap"].shape
-                       # Check if world coordinates are within map bounds
-                       if 0 <= mx < w and 0 <= my < h:
-                            ix, iy = int(mx), int(my)
-                            # Get the value from the data array at integer coordinates
-                            value = diag_data_map[iy, ix]
-                            # Format value based on potential type (int or float) - use general formatting
-                            value_str = f"{value:.4f}" if isinstance(value, (float, np.floating)) else str(value)
-                            self.status_var.set(f"Diagnostic: {selected_map_name} | X: {ix}, Y: {iy} | Value: {value_str} | Zoom: {self.map_canvas.zoom_level:.2f}x")
-                       else:
-                             # Mouse is outside map bounds
-                             self.status_var.set(f"Diagnostic: {selected_map_name} | Zoom: {self.map_canvas.zoom_level:.2f}x")
-                 else:
-                       # Data array not available or shape mismatch
-                       self.status_var.set(f"Diagnostic: {selected_map_name} | (Data N/A) | Zoom: {self.map_canvas.zoom_level:.2f}x")
+                # Update status bar with specific diagnostic value under cursor
+                diag_data_map = self.last_gen_data.get("diagnostic_maps", {}).get(
+                    selected_map_name
+                )
+                if (
+                    diag_data_map is not None
+                    and diag_data_map.shape == self.last_gen_data["heightmap"].shape
+                ):
+                    # Get mouse position relative to canvas window
+                    mouse_x = self.root.winfo_pointerx() - self.map_canvas.winfo_rootx()
+                    mouse_y = self.root.winfo_pointery() - self.map_canvas.winfo_rooty()
+                    # Convert canvas coordinates to world coordinates
+                    mx, my = self.map_canvas.canvas_to_world(mouse_x, mouse_y)
+                    h, w = self.last_gen_data["heightmap"].shape
+                    if 0 <= mx < w and 0 <= my < h:
+                        ix, iy = int(mx), int(my)
+                        value = diag_data_map[iy, ix]
+                        value_str = (
+                            f"{value:.4f}" if isinstance(value, (float, np.floating)) else str(value)
+                        )
+                        self.status_var.set(
+                            f"Diagnostic: {selected_map_name} | X: {ix}, Y: {iy} | Value: {value_str} | Zoom: {self.map_canvas.zoom_level:.2f}x"
+                        )
+                    else:
+                        self.status_var.set(
+                            f"Diagnostic: {selected_map_name} | Zoom: {self.map_canvas.zoom_level:.2f}x"
+                        )
+                else:
+                    self.status_var.set(
+                        f"Diagnostic: {selected_map_name} | (Data N/A) | Zoom: {self.map_canvas.zoom_level:.2f}x"
+                    )
 
-
-                 return # Exit the function after showing diagnostic
+                return  # Exit the function after showing diagnostic
 
 
         # --- Layer Compositing Display ---
@@ -2025,6 +2048,7 @@ class MapGeneratorApp:
         # Redraw the canvas or fit to screen for a new generation
         if is_new_generation:
              self.map_canvas.fit_to_screen()
+             self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
         else:
              self.map_canvas.redraw() # Just redraw with current zoom/pan
 

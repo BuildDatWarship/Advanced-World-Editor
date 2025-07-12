@@ -742,32 +742,31 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
          diagnostic_maps["rainfall_blurred_rivers"] = blurred_river_moisture.copy()
 
 
-    # 4. Combine Blurred Maps
+       # 4. Combine Blurred Maps
     # Total moisture influence is sum of sea moisture (after shadow) and river moisture
     total_moisture_influence = sea_moisture_after_shadow + blurred_river_moisture
-
-    # Add total influence as diagnostic
     diagnostic_maps["rainfall_total_influence"] = total_moisture_influence.copy()
 
+    # Temperature factor for each pixel
+    cc_factor_map = cc_rainfall_multiplier(temp_c)
 
-    # 5. Scale to Global Rainfall Target
-    # Calculate the average value of the total_moisture_influence map
-    average_influence = np.mean(total_moisture_influence)
+    # Apply Clausius-Clapeyron scaling to moisture influence
+    intensity_map = total_moisture_influence * cc_factor_map
+    diagnostic_maps["rainfall_intensity_raw"] = intensity_map.copy()
+
+    # Clip intensities so values >1 do not receive disproportionate rain
+    clipped_intensity = np.clip(intensity_map, 0, 1)
+    diagnostic_maps["rainfall_intensity_clipped"] = clipped_intensity.copy()
+
+    total_weight = clipped_intensity.sum()
 
     final_rainfall_map = np.zeros_like(hmap, dtype=np.float32)
-    if average_influence > 1e-9:
-        # We want the average rainfall over the map to be global_rainfall_target (mm/yr)
-        # Scaling Factor = global_rainfall_target / Average Influence
-        scaling_factor = global_rainfall_target / average_influence
-        final_rainfall_map = total_moisture_influence * scaling_factor
-    else:
-        # If average influence is zero, rainfall is zero everywhere
-        pass # final_rainfall_map is already zeros
-
+    if total_weight > 1e-9:
+        scale = global_rainfall_target * clipped_intensity.size / total_weight
+        final_rainfall_map = clipped_intensity * scale
+    # else remain zeros
 
     # Ensure final rainfall is non-negative
-    cc_factor_map = np.maximum(0.0, 1.0 + 0.07 * (temp_c - 15.0))
-    final_rainfall_map *= cc_factor_map
     final_rainfall_map = np.maximum(0, final_rainfall_map)
 
 
