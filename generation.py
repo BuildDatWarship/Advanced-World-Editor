@@ -10,6 +10,7 @@ from scipy.ndimage import (
     zoom,
 )
 from scipy.fft import fft2, ifft2, fftshift
+from scipy.interpolate import PchipInterpolator
 import numba
 from asteval import Interpreter as AstevalInterpreter # Use safe interpreter
 
@@ -20,14 +21,19 @@ from constants import (
     SEA_LEVEL,
 )
 
+try:
+    from opensimplex import OpenSimplex
+except ModuleNotFoundError:
+    OpenSimplex = None
 # Hypsometric target curves in metres
 EARTHLIKE_OCEAN_CDF_METERS = np.array(
     [
         (0.000, -11000),
         (0.10, -6000),
         (0.25, -4800),
-        (0.62, -4300),
-        (0.71, -130),  # sea-level transition
+        (0.60, -4300),
+        (0.68, -600),
+        (0.72, -130),  # sea-level transition
     ],
     dtype=np.float32,
 )
@@ -35,9 +41,9 @@ EARTHLIKE_OCEAN_CDF_METERS = np.array(
 EARTHLIKE_LAND_CDF_METERS = np.array(
     [
         (0.00, 0),
-        (0.08, 40),
-        (0.29, 300),
-        (0.50, 600),
+        (0.10, 40),
+        (0.33, 300),
+        (0.74, 840),
         (0.97, 2000),
         (0.997, 4500),
         (1.000, 8850),
@@ -133,28 +139,43 @@ def build_earthlike_curves(sea_level, max_h_m):
     land[:, 1] = vfunc(land[:, 1], sea_level, max_h_m)
     return ocean, land
 
-def earthlike_remap(raw, land_mask, ocean_curve, land_curve):
+def dynamic_sea_level(raw, ocean_fraction=SEA_LEVEL):
+    """Return the normalized elevation that yields the requested ocean fraction."""
+    return np.percentile(raw, 100.0 * ocean_fraction)
+
+def _remap_branch(values, target):
+    sorter = np.argsort(values)
+    ranks = np.empty_like(sorter, dtype=np.float32)
+    ranks[sorter] = np.linspace(0.0, 1.0, len(sorter))
+    interp = PchipInterpolator(target[:, 0], target[:, 1], extrapolate=True)
+    mapped = interp(ranks)
+    return mapped
+
+def earthlike_remap(raw, land_mask, ocean_curve, land_curve, sea_level, max_h_m, seed=0):
     """Remap elevations separately for ocean and land using target CDFs."""
     h = raw.copy()
     ocean = ~land_mask
     if ocean.any():
-        vals = h[ocean]
-        order = np.argsort(vals.ravel())
-        p = np.linspace(0.0, 1.0, order.size)
-        mapped = np.interp(p, ocean_curve[:, 0], ocean_curve[:, 1])
-        flat = vals.ravel()
-        flat[order] = mapped
-        h[ocean] = flat.reshape(vals.shape)
+        vals = h[ocean].ravel()
+        mapped = _remap_branch(vals, ocean_curve)
+        h[ocean] = mapped.reshape(h[ocean].shape)
+
 
     land = land_mask
     if land.any():
-        vals = h[land]
-        order = np.argsort(vals.ravel())
-        p = np.linspace(0.0, 1.0, order.size)
-        mapped = np.interp(p, land_curve[:, 0], land_curve[:, 1])
-        flat = vals.ravel()
-        flat[order] = mapped
-        h[land] = flat.reshape(vals.shape)
+        vals = h[land].ravel()
+        mapped = _remap_branch(vals, land_curve)
+        h[land] = mapped.reshape(h[land].shape)
+
+    # small jitter on shallow shelf to avoid flat bands
+    if OpenSimplex is not None:
+        noise = OpenSimplex(seed + 77)
+        shelf = (~land_mask) & (h > meters_to_norm(-200, sea_level, max_h_m))
+        if shelf.any():
+            yi, xi = np.where(shelf)
+            amp = meters_to_norm(6.0, sea_level, max_h_m) - sea_level
+            for y, x in zip(yi, xi):
+                h[y, x] += amp * noise.noise2d(x * 0.01, y * 0.01)
 
     return h
 
@@ -218,21 +239,23 @@ def earthlike(
     else:
         shaped = shaped_hi
 
+# Determine sea level percentile so the correct land fraction remains
+    sea_thresh = dynamic_sea_level(shaped, ocean_fraction=sea_level)
 # Feather coastal zones toward sea level before the CDF remap
-    land_mask = shaped > sea_level
+    land_mask = shaped > sea_thresh
     coast_dist_px = distance_transform_edt(~land_mask)
     coast_dist_px = np.maximum(coast_dist_px - 0.5, 0)
     coast_dist_km = coast_dist_px * km_per_px
     shaped = np.where(
         land_mask,
-        coastal_taper(shaped, coast_dist_km, sea=sea_level, h_interior=min(sea_level + 0.12, 1.0)),
+        coastal_taper(shaped, coast_dist_km, sea=sea_thresh, h_interior=min(sea_thresh + 0.12, 1.0)),
         shaped,
     )
 
     # Apply Earth-like CDF mapping after down-sampling
     # Apply separate ocean and land hypsometry curves
-    ocean_curve, land_curve = build_earthlike_curves(sea_level, max_height_m)
-    shaped = earthlike_remap(shaped, land_mask, ocean_curve, land_curve)
+    ocean_curve, land_curve = build_earthlike_curves(sea_thresh, max_height_m)
+    shaped = earthlike_remap(shaped, land_mask, ocean_curve, land_curve, sea_thresh, max_height_m, seed)
 
 
     shaped = 0.5 + cdf_factor * (shaped - 0.5)
@@ -244,6 +267,21 @@ def generate_perlin_noise(w, h, scale, octaves, seed):
     xv, yv = np.meshgrid(x, y)
     arr = vec_pnoise2(xv / scale, yv / scale, octaves=octaves, persistence=0.5, lacunarity=2.0, base=seed)
     return normalize_map(arr)
+
+def apply_rainfall_erosion(hmap, params, scaling_manager):
+    """Erode terrain proportionally to blurred sea moisture before remapping."""
+    world_diameter_km = params.get("world_diameter_km", 12000)
+    sea_fraction = params.get("sea_level", SEA_LEVEL)
+    sea_level_norm = np.percentile(hmap, 100.0 * sea_fraction)
+
+    sea_mask = (hmap <= sea_level_norm).astype(np.float32)
+    sigma_px = (400.0 / world_diameter_km) * hmap.shape[1]
+    sigma_px = max(0.1, sigma_px)
+    blurred = gaussian_filter(sea_mask, sigma=sigma_px, mode="wrap")
+    max_int = blurred.max() if blurred.max() > 0 else 1.0
+    depth_norm = scaling_manager.to_normalized(params.get("max_erosion_depth_m", 250.0))
+    erosion = depth_norm * (blurred / max_int)
+    return np.clip(hmap - erosion, 0.0, 1.0)
 
 def generate_flow_field_landmass(w, h, scale, ws, octaves, seed):
     fs = scale * 2.0
@@ -274,7 +312,7 @@ def generate_tectonic_map(w, h, num_plates, seed, lloyd_steps=2):
             keep.append(p)
     points = np.array(keep)
 
-    # 2. grow to target count by fission
+     # 2. grow to target count by fission (multiple splits per iteration)
     while len(points) < num_plates:
         tree = cKDTree(points)
         yi, xi = np.indices((h, w))
@@ -286,9 +324,13 @@ def generate_tectonic_map(w, h, num_plates, seed, lloyd_steps=2):
 
         mask = owner == parent
         ys, xs = np.where(mask)
-        k = rng.integers(0, len(xs))
-        new_pt = np.array([xs[k], ys[k]])
-        points = np.vstack([points, new_pt])
+        splits = min(num_plates - len(points), rng.integers(1, 4))
+        for _ in range(splits):
+            k = rng.integers(0, len(xs))
+            new_pt = np.array([xs[k], ys[k]])
+            points = np.vstack([points, new_pt])
+            if len(points) >= num_plates:
+                break
 
     # 3. a couple of Lloyd relaxations
     for _ in range(lloyd_steps):
@@ -538,6 +580,8 @@ def generate_world_data(params, scaling_manager):
 
         diagnostic_maps["6_raw_combined_heightmap"] = hm.copy()
         final_map = normalize_map(hm)
+        # Apply preliminary erosion using blurred sea moisture before remap
+        final_map = apply_rainfall_erosion(final_map, params, scaling_manager)
         final_map = earthlike(
             final_map,
             plate_mask,
@@ -783,6 +827,7 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     h, w = hmap.shape
     temp_c = temp_map_kelvin - KELVIN_TO_CELSIUS_OFFSET
     sigma_factor = cc_rainfall_multiplier(np.mean(temp_c))
+    cc_factor_map = cc_rainfall_multiplier(temp_c)
     sea_level_norm = params.get('sea_level', SEA_LEVEL)
     world_diameter_km = params.get('world_diameter_km', 12000) # Default 12000 km if not set
     global_rainfall_target = params.get('global_rainfall', 985.5) # Default 985.5 mm/yr if not set
@@ -796,9 +841,9 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
 
 
     # 1. Calculate Sea Blur Sigma and blur the sea mask
-    # Interpretation: Sigma is (135 km / World Diameter km) * Map Width (pixels)
+    # Interpretation: Sigma is (400 km / World Diameter km) * Map Width (pixels)
     # This makes the pixel sigma scale with the map size for a constant 'real world' distance
-    sea_blur_sigma_km_base = 200.0
+    sea_blur_sigma_km_base = 400.0
     # Avoid division by zero if world_diameter_km is 0 or tiny
     sea_blur_sigma_pixels = (sea_blur_sigma_km_base / world_diameter_km) * w if world_diameter_km > 1e-9 and w > 0 else 1.0
     sea_blur_sigma_pixels = max(0.1, sea_blur_sigma_pixels) * sigma_factor
@@ -919,23 +964,19 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     total_moisture_influence = sea_moisture_after_shadow + blurred_river_moisture
     diagnostic_maps["rainfall_total_influence"] = total_moisture_influence.copy()
 
-    # Temperature factor for each pixel
-    cc_factor_map = cc_rainfall_multiplier(temp_c)
-
-    # Apply Clausius-Clapeyron scaling to moisture influence
+     # Apply Clausius-Clapeyron scaling to moisture influence
     intensity_map = total_moisture_influence * cc_factor_map
     diagnostic_maps["rainfall_intensity_raw"] = intensity_map.copy()
 
     # Clip intensities so values >1 do not receive disproportionate rain
-    clipped_intensity = np.clip(intensity_map, 0, 1)
-    diagnostic_maps["rainfall_intensity_clipped"] = clipped_intensity.copy()
+    diagnostic_maps["rainfall_intensity"] = intensity_map.copy()
 
-    total_weight = clipped_intensity.sum()
+    total_weight = intensity_map.sum()
 
     final_rainfall_map = np.zeros_like(hmap, dtype=np.float32)
     if total_weight > 1e-9:
-        scale = global_rainfall_target * clipped_intensity.size / total_weight
-        final_rainfall_map = clipped_intensity * scale
+        scale = global_rainfall_target * intensity_map.size / total_weight
+        final_rainfall_map = intensity_map * scale
     # else remain zeros
 
     # Ensure final rainfall is non-negative
