@@ -31,9 +31,10 @@ EARTHLIKE_OCEAN_CDF_METERS = np.array(
         (0.000, -11000),
         (0.10, -6000),
         (0.25, -4800),
-        (0.60, -4300),
-        (0.68, -600),
-        (0.72, -130),  # sea-level transition
+        (0.55, -4300),
+        (0.65, -2500),  # continental slope mid-point
+        (0.70, -600),
+        (0.73, -130),  # shelf break  # sea-level transition
     ],
     dtype=np.float32,
 )
@@ -50,6 +51,9 @@ EARTHLIKE_LAND_CDF_METERS = np.array(
     ],
     dtype=np.float32,
 )
+
+# Fraction of the remapped value to use; remainder retains raw ranking
+ADHERENCE = 0.85
 
 # --- Helper functions specific to generation ---
 # ---------- OpenSimplex (or Perlin) helpers: paste this block ----------
@@ -143,13 +147,18 @@ def dynamic_sea_level(raw, ocean_fraction=SEA_LEVEL):
     """Return the normalized elevation that yields the requested ocean fraction."""
     return np.percentile(raw, 100.0 * ocean_fraction)
 
-def _remap_branch(values, target):
+def partial_remap(values, target, adherence=ADHERENCE):
+    """Map values to a target CDF while retaining some native variance."""
     sorter = np.argsort(values)
     ranks = np.empty_like(sorter, dtype=np.float32)
     ranks[sorter] = np.linspace(0.0, 1.0, len(sorter))
     interp = PchipInterpolator(target[:, 0], target[:, 1], extrapolate=True)
-    mapped = interp(ranks)
-    return mapped
+    earthlike = interp(ranks)
+    native_sorted = np.sort(values)
+    blended = adherence * earthlike + (1.0 - adherence) * native_sorted
+    out = np.empty_like(values, dtype=np.float32)
+    out[sorter] = blended
+    return out
 
 def earthlike_remap(raw, land_mask, ocean_curve, land_curve, sea_level, max_h_m, seed=0):
     """Remap elevations separately for ocean and land using target CDFs."""
@@ -157,25 +166,26 @@ def earthlike_remap(raw, land_mask, ocean_curve, land_curve, sea_level, max_h_m,
     ocean = ~land_mask
     if ocean.any():
         vals = h[ocean].ravel()
-        mapped = _remap_branch(vals, ocean_curve)
+        mapped = partial_remap(vals, ocean_curve)
         h[ocean] = mapped.reshape(h[ocean].shape)
 
 
     land = land_mask
     if land.any():
         vals = h[land].ravel()
-        mapped = _remap_branch(vals, land_curve)
+        mapped = partial_remap(vals, land_curve)
         h[land] = mapped.reshape(h[land].shape)
 
     # small jitter on shallow shelf to avoid flat bands
     if OpenSimplex is not None:
         noise = OpenSimplex(seed + 77)
+        base_fn = getattr(noise, "noise2", None) or noise.noise2d
         shelf = (~land_mask) & (h > meters_to_norm(-200, sea_level, max_h_m))
         if shelf.any():
             yi, xi = np.where(shelf)
             amp = meters_to_norm(6.0, sea_level, max_h_m) - sea_level
             for y, x in zip(yi, xi):
-                h[y, x] += amp * noise.noise2d(x * 0.01, y * 0.01)
+                h[y, x] += amp * base_fn(x * 0.01, y * 0.01)
 
     return h
 
@@ -257,7 +267,12 @@ def earthlike(
     ocean_curve, land_curve = build_earthlike_curves(sea_thresh, max_height_m)
     shaped = earthlike_remap(shaped, land_mask, ocean_curve, land_curve, sea_thresh, max_height_m, seed)
 
-
+# Re-align the percentile so the desired land fraction remains
+    new_thresh = np.percentile(shaped, 100.0 * sea_level)
+    delta = sea_thresh - new_thresh
+    shaped += delta
+    shaped = np.clip(shaped, 0.0, 1.0)
+    
     shaped = 0.5 + cdf_factor * (shaped - 0.5)
     return np.clip(shaped, 0.0, 1.0)
 
