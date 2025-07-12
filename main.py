@@ -37,7 +37,7 @@ class MapGeneratorApp:
             "continent_scale": tk.DoubleVar(value=200.0),
             "flow_distortion": tk.DoubleVar(value=70.0),
             "continent_octaves": tk.IntVar(value=6),
-            "plate_points": tk.IntVar(value=12),
+            "plate_points": tk.IntVar(value=7),
             "uplift_magnitude": tk.DoubleVar(value=0.6),
             "tectonic_smoothing": tk.DoubleVar(value=3.0),
             "hypsometric_strength": tk.DoubleVar(value=1.0),
@@ -1109,9 +1109,9 @@ class MapGeneratorApp:
             self.status_var.set("Simulating climate (1/5): Calculating Albedo..."); self.root.update_idletasks()
             # Albedo calculation needs biome indices map if available, otherwise uses hmap
             if "biome_indices_map" in self.last_gen_data and self.last_gen_data["biome_indices_map"] is not None:
-                current_albedo = gen.calculate_albedo_map(self.last_gen_data['biome_indices_map'], biomes, hmap, params.get('sea_level', 0.4))
+                current_albedo = gen.calculate_albedo_map(self.last_gen_data['biome_indices_map'], biomes, hmap, params.get('sea_level', SEA_LEVEL))
             else: # Otherwise, use a simple land/sea albedo
-                current_albedo = gen.calculate_albedo_map(np.full_like(hmap, -1, dtype=np.int8), biomes, hmap, params.get('sea_level', 0.4)) # Pass dummy indices map
+                current_albedo = gen.calculate_albedo_map(np.full_like(hmap, -1, dtype=np.int8), biomes, hmap, params.get('sea_level', SEA_LEVEL)) # Pass dummy indices map
 
             self.last_gen_data.setdefault("diagnostic_maps", {})["climate_albedo"] = current_albedo.copy() # Store albedo as diagnostic
 
@@ -1809,7 +1809,7 @@ class MapGeneratorApp:
              land_mask = self.last_gen_data.get("land_mask")
              if land_mask is None:
                   # Fallback: generate land mask from heightmap if climate sim hasn't run or failed
-                  sea_level_norm = params.get("sea_level", 0.4)
+                  sea_level_norm = params.get("sea_level", SEA_LEVEL)
                   land_mask = hmap > sea_level_norm
                   print("Warning: Land mask missing for river visual, generating from heightmap.")
 
@@ -1863,7 +1863,7 @@ class MapGeneratorApp:
                   self.status_var.set("Applying altitude tint..."); # Update status bar
                   self.root.update_idletasks()
                   try:
-                       sea_level_norm = params.get("sea_level", 0.4)
+                       sea_level_norm = params.get("sea_level", SEA_LEVEL)
                        # Pass a copy of biome_image to avoid modifying the original
                        tinted_image = gen.apply_altitude_tint(
                             biome_image.copy(), # Use the base biome image

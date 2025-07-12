@@ -2,21 +2,48 @@ import numpy as np
 import noise
 from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
-from scipy.ndimage import gaussian_filter, label, map_coordinates, distance_transform_edt
+from scipy.ndimage import (
+    gaussian_filter,
+    label,
+    map_coordinates,
+    distance_transform_edt,
+    zoom,
+)
 from scipy.fft import fft2, ifft2, fftshift
 import numba
 from asteval import Interpreter as AstevalInterpreter # Use safe interpreter
 
-from constants import STEFAN_BOLTZMANN, KELVIN_TO_CELSIUS_OFFSET, cc_rainfall_multiplier
+from constants import (
+    STEFAN_BOLTZMANN,
+    KELVIN_TO_CELSIUS_OFFSET,
+    cc_rainfall_multiplier,
+    SEA_LEVEL,
+)
 
-EARTHLIKE_CDF = np.array([
-    (0.00, 0.0),        # deepest trench
-    (0.71, 0.31234),    # abyssal peak
-    (0.71, 0.55164),    # shelf break
-    (0.97, 0.59446),    # continental mean
-    (0.997, 0.65390),   # 3% above 2 km
-    (1.00, 1.0),        # Everest
-], dtype=np.float32)
+# Hypsometric target curves in metres
+EARTHLIKE_OCEAN_CDF_METERS = np.array(
+    [
+        (0.000, -11000),
+        (0.10, -6000),
+        (0.25, -4800),
+        (0.62, -4300),
+        (0.71, -130),  # sea-level transition
+    ],
+    dtype=np.float32,
+)
+
+EARTHLIKE_LAND_CDF_METERS = np.array(
+    [
+        (0.00, 0),
+        (0.08, 40),
+        (0.29, 300),
+        (0.50, 600),
+        (0.97, 2000),
+        (0.997, 4500),
+        (1.000, 8850),
+    ],
+    dtype=np.float32,
+)
 
 # --- Helper functions specific to generation ---
 # ---------- OpenSimplex (or Perlin) helpers: paste this block ----------
@@ -73,35 +100,141 @@ def normalize_map(d):
 # --- Vectorized Wrappers for the 'noise' library ---
 vec_pnoise2 = np.vectorize(noise.pnoise2)
 
+def radial_taper(shape, knee_px, slope=6):
+    """Return a smooth radial mask that tapers near the Nyquist frequency."""
+    H, W = shape
+    kx = np.fft.fftfreq(W)[:, None]
+    ky = np.fft.fftfreq(H)[None, :]
+    k = np.sqrt(kx ** 2 + ky ** 2)
+    return 1.0 / (1.0 + np.exp(slope * (k - 1.0 / knee_px)))
+
+def logistic(x, mid, spread):
+    """Basic logistic function used for smooth blending."""
+    return 1.0 / (1.0 + np.exp(-(x - mid) / spread))
+
+def coastal_taper(h, dist, sea=0.4, h_interior=0.5, width_km=150.0):
+    """Feather elevations near the coast toward sea level."""
+    w = logistic(dist, width_km * 0.5, 0.15 * width_km)
+    return sea + (1.0 - w) * np.clip(h, sea, h_interior) + w * h
+
+def meters_to_norm(h_m, sea_level, max_h_m, min_depth_m=-11000.0):
+    """Convert a physical elevation to normalized units."""
+    if h_m >= 0:
+        return sea_level + (h_m / max_h_m) * (1.0 - sea_level)
+    else:
+        return sea_level * (h_m - min_depth_m) / (0.0 - min_depth_m)
+
+def build_earthlike_curves(sea_level, max_h_m):
+    """Return ocean/land CDF curves normalised to 0..1."""
+    vfunc = np.vectorize(meters_to_norm)
+    ocean = EARTHLIKE_OCEAN_CDF_METERS.copy()
+    land = EARTHLIKE_LAND_CDF_METERS.copy()
+    ocean[:, 1] = vfunc(ocean[:, 1], sea_level, max_h_m)
+    land[:, 1] = vfunc(land[:, 1], sea_level, max_h_m)
+    return ocean, land
+
+def earthlike_remap(raw, land_mask, ocean_curve, land_curve):
+    """Remap elevations separately for ocean and land using target CDFs."""
+    h = raw.copy()
+    ocean = ~land_mask
+    if ocean.any():
+        vals = h[ocean]
+        order = np.argsort(vals.ravel())
+        p = np.linspace(0.0, 1.0, order.size)
+        mapped = np.interp(p, ocean_curve[:, 0], ocean_curve[:, 1])
+        flat = vals.ravel()
+        flat[order] = mapped
+        h[ocean] = flat.reshape(vals.shape)
+
+    land = land_mask
+    if land.any():
+        vals = h[land]
+        order = np.argsort(vals.ravel())
+        p = np.linspace(0.0, 1.0, order.size)
+        mapped = np.interp(p, land_curve[:, 0], land_curve[:, 1])
+        flat = vals.ravel()
+        flat[order] = mapped
+        h[land] = flat.reshape(vals.shape)
+
+    return h
+
 # --- Heightmap shaping based on tectonic distance and Earth-like statistics ---
-def earthlike(height, plate_mask, world_diameter_km, cdf_factor=1.0,
-              spectral_slope=-2.0, sigma_edge=1.0, sigma_core=12.0, blend_km=250.0,
-              target_cdf=EARTHLIKE_CDF):
+def earthlike(
+    height,
+    plate_mask,
+    world_diameter_km,
+    cdf_factor=1.0,
+    spectral_slope=-2.0,
+    sigma_edge=1.0,
+    sigma_core=12.0,
+    blend_km=250.0,
+    oversample=2,
+    taper_knee_px=8,
+    micro_relief_amp=0.03,
+    sea_level=SEA_LEVEL,
+    seed=0,
+    max_height_m=8848.0,
+):
     """Smooth heightmap interiors and remap elevations to an Earth-like CDF."""
-    dist_px = distance_transform_edt(1 - plate_mask)
-    km_per_px = world_diameter_km / height.shape[1] if height.shape[1] else 1.0
-    w = np.clip(dist_px * km_per_px / blend_km, 0, 1)
-    h_edge = gaussian_filter(height, sigma_edge / km_per_px)
-    h_core = gaussian_filter(height, sigma_core / km_per_px)
+
+    # --- Optional oversampling to avoid ringing artefacts ---
+    if oversample > 1:
+        height_hi = zoom(height, oversample, order=3)
+        mask_hi = zoom(plate_mask, oversample, order=0)
+    else:
+        height_hi = height
+        mask_hi = plate_mask
+
+    dist_px = distance_transform_edt(1 - mask_hi)
+    km_per_px = world_diameter_km / height_hi.shape[1] if height_hi.shape[1] else 1.0
+
+    # Smooth blend from plate edges using a logistic ramp
+    dist_km = dist_px * km_per_px
+    w = logistic(dist_km, blend_km / 2.0, max(1.0, blend_km / 10.0))
+    h_edge = gaussian_filter(height_hi, sigma_edge / km_per_px)
+    h_core = gaussian_filter(height_hi, sigma_core / km_per_px)
     blurred = (1 - w) * h_edge + w * h_core
 
+    # Spectral shaping with a soft radial taper
     H, W = blurred.shape
     kx = fftshift(np.fft.fftfreq(W))[:, None]
     ky = fftshift(np.fft.fftfreq(H))[None, :]
     k = np.sqrt(kx ** 2 + ky ** 2) + 1e-9
     spec = fft2(blurred)
-    spec *= k ** (spectral_slope / 2.0)
-    shaped = np.real(ifft2(spec))
+    spec *= k ** (spectral_slope / 2.0) * radial_taper(blurred.shape, taper_knee_px * oversample)
+    shaped_hi = np.real(ifft2(spec))
 
-    # Two differently blurred versions of the height field
-    if target_cdf is not None:
-        flat = shaped.ravel()
-        ranks = np.argsort(np.argsort(flat))
-        cdf_pos = ranks / float(flat.size - 1)
-        flat = np.interp(cdf_pos, target_cdf[:, 0], target_cdf[:, 1])
-        shaped = flat.reshape(shaped.shape)
+    # Inject a whisper of micro relief to mask residual grid artefacts
+    noise2 = _make_noise2(seed)
+    x = np.arange(W, dtype=np.float32)
+    y = np.arange(H, dtype=np.float32)
+    X, Y = np.meshgrid(x, y)
+    micro = noise2(X * 0.02, Y * 0.02)
+    shaped_hi += micro_relief_amp * micro
 
-    # Blend weight ramps from 0 at the boundary to 1 in the interior
+    # Downsample with anti-aliasing back to the original resolution
+    if oversample > 1:
+        shaped = zoom(shaped_hi, 1.0 / oversample, order=3)
+    else:
+        shaped = shaped_hi
+
+# Feather coastal zones toward sea level before the CDF remap
+    land_mask = shaped > sea_level
+    coast_dist_px = distance_transform_edt(~land_mask)
+    coast_dist_px = np.maximum(coast_dist_px - 0.5, 0)
+    coast_dist_km = coast_dist_px * km_per_px
+    shaped = np.where(
+        land_mask,
+        coastal_taper(shaped, coast_dist_km, sea=sea_level, h_interior=min(sea_level + 0.12, 1.0)),
+        shaped,
+    )
+
+    # Apply Earth-like CDF mapping after down-sampling
+    # Apply separate ocean and land hypsometry curves
+    ocean_curve, land_curve = build_earthlike_curves(sea_level, max_height_m)
+    shaped = earthlike_remap(shaped, land_mask, ocean_curve, land_curve)
+
+
     shaped = 0.5 + cdf_factor * (shaped - 0.5)
     return np.clip(shaped, 0.0, 1.0)
 
@@ -128,14 +261,55 @@ def generate_ridged_multifractal_noise(w, h, scale, octaves, seed):
     arr = (1.0 - np.abs(raw_noise)) ** 2
     return normalize_map(arr)
 
-def generate_tectonic_map(w, h, num_plates, seed):
+def generate_tectonic_map(w, h, num_plates, seed, lloyd_steps=2):
+    """Voronoi plates grown by successive fission."""
     rng = np.random.default_rng(seed)
-    points = rng.random((num_plates, 2)) * [w, h]
-    velocities = rng.random((num_plates, 2)) * 2 - 1
+
+    # 1. start from seven majors, Poisson-disc to avoid crowding
+    points = rng.random((7, 2)) * [w, h]
+    min_d2 = (0.18 * min(w, h)) ** 2
+    keep = []
+    for p in points:
+        if all(((p - q) ** 2).sum() > min_d2 for q in keep):
+            keep.append(p)
+    points = np.array(keep)
+
+    # 2. grow to target count by fission
+    while len(points) < num_plates:
+        tree = cKDTree(points)
+        yi, xi = np.indices((h, w))
+        px = np.stack((xi.ravel(), yi.ravel()), axis=-1)
+        owner = tree.query(px, k=1)[1].reshape(h, w)
+        areas = np.bincount(owner.ravel(), minlength=len(points))
+        probs = areas / areas.sum()
+        parent = rng.choice(len(points), p=probs)
+
+        mask = owner == parent
+        ys, xs = np.where(mask)
+        k = rng.integers(0, len(xs))
+        new_pt = np.array([xs[k], ys[k]])
+        points = np.vstack([points, new_pt])
+
+    # 3. a couple of Lloyd relaxations
+    for _ in range(lloyd_steps):
+        tree = cKDTree(points)
+        yi, xi = np.indices((h, w))
+        px = np.stack((xi.ravel(), yi.ravel()), axis=-1)
+        owner = tree.query(px, k=1)[1]
+        sums = np.zeros_like(points)
+        counts = np.zeros(len(points))
+        np.add.at(sums, owner, px)
+        np.add.at(counts, owner, 1)
+        points = sums / counts[:, None]
+
+    # 4. assign random velocity to each plate
+    velocities = rng.random((len(points), 2)) * 2 - 1
+
+    # 5. build tectonic potential & boundary mask
     tree = cKDTree(points)
-    neighbor_indices = tree.query(points, k=min(num_plates, 5))[1]
-    plate_potentials = np.zeros(num_plates)
-    for i in range(num_plates):
+    neighbor_indices = tree.query(points, k=min(len(points), 5))[1]
+    plate_potentials = np.zeros(len(points))
+    for i in range(len(points)):
         for j in neighbor_indices[i, 1:]:
             v_rel = velocities[j] - velocities[i]
             norm = np.linalg.norm(points[j] - points[i])
@@ -148,11 +322,10 @@ def generate_tectonic_map(w, h, num_plates, seed):
     dist, indices = tree.query(pixel_coords, k=2)
     d1, d2 = dist[:, 0], dist[:, 1]
     p1, p2 = plate_potentials[indices[:, 0]], plate_potentials[indices[:, 1]]
-    epsilon = 1e-6
-    w1, w2 = 1 / (d1**2 + epsilon), 1 / (d2**2 + epsilon)
+    eps = 1e-6
+    w1, w2 = 1 / (d1**2 + eps), 1 / (d2**2 + eps)
     tectonic_map = (p1 * w1 + p2 * w2) / (w1 + w2)
 
-    # Create a boundary mask by checking neighbouring plate indices
     nearest = indices[:, 0].reshape(h, w)
     plate_mask = np.zeros((h, w), dtype=np.uint8)
     plate_mask[1:, :] |= nearest[1:, :] != nearest[:-1, :]
@@ -300,7 +473,7 @@ def _run_river_simulation_numba(hmap, sea_level_norm, flow_field_angles, temp_c,
 
 def generate_flow_field_rivers(hmap, params):
     h, w = hmap.shape
-    sea_level = params.get('sea_level', 0.4)
+    sea_level = params.get('sea_level', SEA_LEVEL)
     flow_field_angles = calculate_flow_field(hmap, params)
     # Correct parameter order for the numba simulation helper
     temp_dummy = np.full_like(hmap, 20.0, dtype=np.float32)
@@ -370,6 +543,8 @@ def generate_world_data(params, scaling_manager):
             plate_mask,
             params.get("world_diameter_km", 12000),
             params.get("hypsometric_strength", 1.0),
+            sea_level=params.get("sea_level", SEA_LEVEL),
+            max_height_m=params.get("max_world_height_m", 8848),
         )
         diagnostic_maps["6b_earthlike_heightmap"] = final_map.copy()
 
@@ -407,57 +582,54 @@ def generate_world_data(params, scaling_manager):
 # Extracted the calculation part from the old generate_flow_field_rivers
 # It takes hmap and flow_field_angles as inputs now
 def calculate_river_deposition(hmap, flow_field_angles, params, scaling_manager, temp_map_kelvin=None):
-     """
-     Runs the particle simulation to determine river deposition paths.
-     Takes hmap and flow_field_angles as input.
-     Particles are spawned on land and terminate in the sea.
-     """
-     h, w = hmap.shape
-     sea_level_norm = params.get('sea_level', 0.4)
+    """Run the particle simulation to determine river deposition paths."""
+    h, w = hmap.shape
+    sea_level_norm = params.get('sea_level', SEA_LEVEL)
 
-     temp_c = np.full_like(hmap, 20.0, dtype=np.float32)
-     if temp_map_kelvin is not None:
-         temp_c = temp_map_kelvin - KELVIN_TO_CELSIUS_OFFSET
+    temp_c = np.full_like(hmap, 20.0, dtype=np.float32)
+    if temp_map_kelvin is not None:
+        temp_c = temp_map_kelvin - KELVIN_TO_CELSIUS_OFFSET
 
-     height_m = scaling_manager.to_real(np.maximum(hmap - sea_level_norm, 0))
-     dist_px = distance_transform_edt(hmap <= sea_level_norm)
-     km_per_pixel = params.get('world_diameter_km', 12000) / w if w > 0 else 1.0
-     dist_km = dist_px * km_per_pixel
+    height_m = scaling_manager.to_real(np.maximum(hmap - sea_level_norm, 0))
+    dist_px = distance_transform_edt(hmap <= sea_level_norm)
+    km_per_pixel = params.get('world_diameter_km', 12000) / w if w > 0 else 1.0
+    dist_km = dist_px * km_per_pixel
 
-     temp_factor = cc_rainfall_multiplier(temp_c)
-     spawn_prob = temp_factor * 0.63
-     spawn_prob *= (1.0 + 0.0013 * np.minimum(height_m, 2000.0))
-     spawn_prob *= 1.0 / (1.0 + np.exp((height_m - 2000.0) / 400.0))
-     spawn_prob *= np.exp(-dist_km / 150.0)
-     spawn_prob[(temp_c <= 0) | (hmap <= sea_level_norm)] = 0
+    temp_factor = cc_rainfall_multiplier(temp_c)
+    spawn_prob = temp_factor * 0.63
+    spawn_prob *= (1.0 + 0.0013 * np.minimum(height_m, 2000.0))
+    spawn_prob *= 1.0 / (1.0 + np.exp((height_m - 2000.0) / 400.0))
+    spawn_prob *= np.exp(-dist_km / 150.0)
+    spawn_prob[(temp_c <= 0) | (hmap <= sea_level_norm)] = 0
 
-     flat = spawn_prob.ravel()
-     s = flat.sum()
-     if s > 0:
-         cdf = np.cumsum(flat / s)
-     else:
-         cdf = np.linspace(0, 1, flat.size)
+    flat = spawn_prob.ravel()
+    s = flat.sum()
+    if s > 0:
+        cdf = np.cumsum(flat / s)
+    else:
+        cdf = np.linspace(0, 1, flat.size)
 
-     deposition_map = _run_river_simulation_numba(
-          hmap,
-          sea_level_norm,
-          flow_field_angles,
-          temp_c,
-          cdf,
-          params["particle_count"],
-          params["particle_steps"],
-          params["particle_fade"],
-          params["particle_steps"] // 2,
-          1.0
-     )
-     deposition_map[temp_c <= 0] = 0
-     return {
-         "deposition_map": deposition_map,
-         "diagnostics": {
-             "river_deposition_raw": deposition_map.copy(),
-             "river_spawn_probability": spawn_prob,
-         },
-     }
+    deposition_map = _run_river_simulation_numba(
+        hmap,
+        sea_level_norm,
+        flow_field_angles,
+        temp_c,
+        cdf,
+        params["particle_count"],
+        params["particle_steps"],
+        params["particle_fade"],
+        params["particle_steps"] // 2,
+        1.0,
+    )
+    deposition_map[temp_c <= 0] = 0
+    return {
+        "deposition_map": deposition_map,
+        "diagnostics": {
+            "river_deposition_raw": deposition_map.copy(),
+            "river_spawn_probability": spawn_prob,
+        },
+    }
+
 
 def create_river_image(deposition_map, land_mask):
         """
@@ -611,7 +783,7 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     h, w = hmap.shape
     temp_c = temp_map_kelvin - KELVIN_TO_CELSIUS_OFFSET
     sigma_factor = cc_rainfall_multiplier(np.mean(temp_c))
-    sea_level_norm = params.get('sea_level', 0.4)
+    sea_level_norm = params.get('sea_level', SEA_LEVEL)
     world_diameter_km = params.get('world_diameter_km', 12000) # Default 12000 km if not set
     global_rainfall_target = params.get('global_rainfall', 985.5) # Default 985.5 mm/yr if not set
     orographic_strength = params.get('orographic_strength', 1.5) # Used to scale rain shadow

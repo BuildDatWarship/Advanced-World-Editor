@@ -3,7 +3,8 @@
 METERS_TO_FEET = 3.28084
 STEFAN_BOLTZMANN = 5.670374419e-8
 KELVIN_TO_CELSIUS_OFFSET = 273.15
-SEA_LEVEL = 0.4  # Default normalized sea level
+# Fraction of the planet covered by oceans and inland water
+SEA_LEVEL = 0.71  # Default normalized sea level
 
 import numpy as np
 
