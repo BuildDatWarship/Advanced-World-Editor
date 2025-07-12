@@ -77,7 +77,7 @@ class MapGeneratorApp:
             # --- Geostrophic Wind Variables ---
             "enable_geostrophic_winds": tk.BooleanVar(value=True),
             "geostrophic_wind_kmh": tk.DoubleVar(value=20.0),
-            "geostrophic_blur_sigmas": tk.StringVar(value="2, 4, 8"),␊
+            "geostrophic_blur_sigmas": tk.StringVar(value="2, 4, 8"),
             "geostrophic_advection_steps": tk.IntVar(value=4), # Changed default to 2
             "world_diameter_km": tk.IntVar(value=12000), # Changed default to 12000
             "final_temp_blur_sigma": tk.DoubleVar(value=3.0), # Added final temperature blur sigma
@@ -90,8 +90,9 @@ class MapGeneratorApp:
             "temperature_latitude_gradient_formula": tk.StringVar(value=DEFAULT_FORMULAS["temperature_latitude_gradient_formula"]),
             "temperature_lapse_rate_term_formula": tk.StringVar(value=DEFAULT_FORMULAS["temperature_lapse_rate_term_formula"]),
             "rainfall_orographic_effect_formula": tk.StringVar(value=DEFAULT_FORMULAS["rainfall_orographic_effect_formula"]),
-
+        
         }
+
         self.scaling_manager = ScalingManager(self)
         self.history = HistoryManager(self)
         self.biomes = []
