@@ -2,11 +2,22 @@ import numpy as np
 import noise
 from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
-from scipy.ndimage import gaussian_filter, label, map_coordinates
+from scipy.ndimage import gaussian_filter, label, map_coordinates, distance_transform_edt
+from scipy.fft import fft2, ifft2
+import cv2
 import numba
 from asteval import Interpreter as AstevalInterpreter # Use safe interpreter
 
-from constants import STEFAN_BOLTZMANN, KELVIN_TO_CELSIUS_OFFSET
+from constants import STEFAN_BOLTZMANN, KELVIN_TO_CELSIUS_OFFSET, cc_rainfall_multiplier
+
+EARTHLIKE_CDF = np.array([
+    (0.00, 0.0),        # deepest trench
+    (0.71, 0.31234),    # abyssal peak
+    (0.71, 0.55164),    # shelf break
+    (0.97, 0.59446),    # continental mean
+    (0.997, 0.65390),   # 3% above 2 km
+    (1.00, 1.0),        # Everest
+], dtype=np.float32)
 
 # --- Helper functions specific to generation ---
 # ---------- OpenSimplex (or Perlin) helpers: paste this block ----------
@@ -63,6 +74,90 @@ def normalize_map(d):
 # --- Vectorized Wrappers for the 'noise' library ---
 vec_pnoise2 = np.vectorize(noise.pnoise2)
 
+
+def radial_taper(shape, knee_px, slope=6.0):
+    """Smoothly roll off spectral amplification near the Nyquist frequency."""
+    H, W = shape
+    kx = np.fft.fftfreq(W)[:, None]
+    ky = np.fft.fftfreq(H)[None, :]
+    k = np.sqrt(kx ** 2 + ky ** 2)
+    return 1.0 / (1.0 + np.exp(slope * (k - 1.0 / knee_px)))
+
+
+def _perlin(shape, freq=0.02, warp=0.005, seed=0):
+    """Generate lightly warped Perlin/OpenSimplex noise."""
+    h, w = shape
+    x = np.arange(w, dtype=np.float32)
+    y = np.arange(h, dtype=np.float32)
+    X, Y = np.meshgrid(x, y)
+    n2 = _make_noise2(seed)
+    if warp > 0:
+        warp_x = n2(X * freq * 3, Y * freq * 3) * warp * w
+        warp_y = n2(X * freq * 3 + 11, Y * freq * 3 + 7) * warp * h
+        X = X + warp_x
+        Y = Y + warp_y
+    return n2(X * freq, Y * freq)
+
+
+# --- Heightmap shaping based on tectonic distance and Earth-like statistics ---
+def earthlike(height, plate_mask, world_diameter_km, cdf_factor=1.0,
+              spectral_slope=-2.0, sigma_edge=1.0, sigma_core=12.0,
+              blend_km=250.0, oversample=1.5, target_cdf=EARTHLIKE_CDF,
+              seed=0):
+    """Smooth heightmap interiors, apply spectral shaping, and remap elevations."""
+
+    h, w = height.shape
+    # --- 1. Upsample for more stable filtering ---------------------------------
+    if oversample > 1.01:
+        hi_w, hi_h = int(w * oversample), int(h * oversample)
+        hi_height = cv2.resize(height, (hi_w, hi_h), interpolation=cv2.INTER_CUBIC)
+        hi_mask = cv2.resize(plate_mask.astype(np.float32), (hi_w, hi_h), interpolation=cv2.INTER_NEAREST)
+    else:
+        hi_height = height
+        hi_mask = plate_mask.astype(np.float32)
+
+    # --- 2. Distance-weighted Gaussian blur with smooth blending ---------------
+    dist_px = distance_transform_edt(1 - hi_mask)
+    km_per_px = world_diameter_km / w / oversample if w > 0 else 1.0
+    mid = blend_km * 0.5
+    spread = max(1.0, blend_km / 10.0)
+    w_blend = 1.0 / (1.0 + np.exp(-(dist_px * km_per_px - mid) / spread))
+    h_edge = gaussian_filter(hi_height, sigma_edge / km_per_px)
+    h_core = gaussian_filter(hi_height, sigma_core / km_per_px)
+    blurred = (1.0 - w_blend) * h_edge + w_blend * h_core
+
+    # --- 3. Spectral shaping with soft roll-off --------------------------------
+    H2, W2 = blurred.shape
+    kx = np.fft.fftfreq(W2)[None, :]
+    ky = np.fft.fftfreq(H2)[:, None]
+    k = np.sqrt(kx ** 2 + ky ** 2) + 1e-9
+    spec = fft2(blurred)
+    spec *= k ** (spectral_slope / 2.0) * radial_taper((H2, W2), knee_px=2)
+    shaped = np.real(ifft2(spec))
+
+    # --- 4. Downsample back to original resolution -----------------------------
+    if oversample > 1.01:
+        shaped = cv2.resize(shaped, (w, h), interpolation=cv2.INTER_AREA)
+
+    # --- 5. Remap elevations to target hypsometry ------------------------------
+    if target_cdf is not None:
+        flat = shaped.ravel()
+        ranks = np.argsort(np.argsort(flat))
+        cdf_pos = ranks / float(flat.size - 1)
+        flat = np.interp(cdf_pos, target_cdf[:, 0], target_cdf[:, 1])
+        shaped = flat.reshape(shaped.shape)
+
+    shaped = 0.5 + cdf_factor * (shaped - 0.5)
+    shaped = np.clip(shaped, 0.0, 1.0)
+
+    # --- 6. Add a whisper of micro-relief to disguise grid structure -----------
+    amp = 0.03 * (np.percentile(shaped, 95) - np.percentile(shaped, 5))
+    if amp > 1e-6:
+        shaped += amp * _perlin(shaped.shape, freq=0.02, warp=0.005, seed=seed)
+        shaped = np.clip(shaped, 0.0, 1.0)
+
+    return shaped
+
 # --- Generation Algorithms ---
 def generate_perlin_noise(w, h, scale, octaves, seed):
     x, y = np.arange(w), np.arange(h)
@@ -100,6 +195,7 @@ def generate_tectonic_map(w, h, num_plates, seed):
             if norm > 1e-9:
                 boundary_normal = (points[j] - points[i]) / norm
                 plate_potentials[i] -= np.dot(v_rel, boundary_normal)
+
     yi, xi = np.indices((h, w))
     pixel_coords = np.stack((xi.ravel(), yi.ravel()), axis=-1)
     dist, indices = tree.query(pixel_coords, k=2)
@@ -108,7 +204,16 @@ def generate_tectonic_map(w, h, num_plates, seed):
     epsilon = 1e-6
     w1, w2 = 1 / (d1**2 + epsilon), 1 / (d2**2 + epsilon)
     tectonic_map = (p1 * w1 + p2 * w2) / (w1 + w2)
-    return normalize_map(tectonic_map.reshape(h, w)), points, velocities
+
+    # Create a boundary mask by checking neighbouring plate indices
+    nearest = indices[:, 0].reshape(h, w)
+    plate_mask = np.zeros((h, w), dtype=np.uint8)
+    plate_mask[1:, :] |= nearest[1:, :] != nearest[:-1, :]
+    plate_mask[:, 1:] |= nearest[:, 1:] != nearest[:, :-1]
+    plate_mask[:-1, :] |= nearest[:-1, :] != nearest[1:, :]
+    plate_mask[:, :-1] |= nearest[:, :-1] != nearest[:, 1:]
+
+    return normalize_map(tectonic_map.reshape(h, w)), points, velocities, plate_mask
 
 def calculate_flow_field(hmap, params):
     h, w = hmap.shape
@@ -129,27 +234,29 @@ def calculate_flow_field(hmap, params):
     return flow_field_angles # This function should still exist
 
 # --- Update the Numba function to handle spawning and clipping ---
-@numba.jit(nopython=True, fastmath=True)
-def _run_river_simulation_numba(hmap, sea_level_norm, flow_field_angles, particle_count, max_steps, fade, simulation_duration, step_length):
+@numba.njit(fastmath=True)
+def _run_river_simulation_numba(hmap, sea_level_norm, flow_field_angles, temp_c, spawn_cdf,
+                                particle_count, max_steps, fade, simulation_duration, step_length):
+    """Run the river particle simulation with temperature-aware spawning."""
     h, w = hmap.shape
     image_data = np.zeros((h, w), dtype=np.float32)
 
-    # Initial particle positions - try to spawn on land
-    particles_x, particles_y = np.zeros(particle_count, dtype=np.float32), np.zeros(particle_count, dtype=np.float32)
+    def sample_spawn():
+        idx = np.searchsorted(spawn_cdf, np.random.random())
+        iy = idx // w
+        ix = idx - iy * w
+        return float(ix), float(iy)
 
-    # Initial spawning loop - spawn only on land
+    particles_xy = np.zeros((particle_count, 2), dtype=np.float32)
+    particle_steps = np.zeros(particle_count, dtype=np.int32)
+
     for i in range(particle_count):
         while True:
-            px, py = np.random.uniform(0, w), np.random.uniform(0, h)
-            ix, iy = int(px), int(py)
-            # Check bounds and land condition
-            if 0 <= ix < w and 0 <= iy < h and hmap[iy, ix] > sea_level_norm:
-                particles_x[i], particles_y[i] = px, py
-                break # Found a valid land spot, move to the next particle
-
-    particles_xy = np.empty((particle_count, 2), dtype=np.float32)
-    particles_xy[:, 0], particles_xy[:, 1] = particles_x, particles_y
-    particle_steps = np.zeros(particle_count, dtype=np.int32)
+            sx, sy = sample_spawn()
+            ix, iy = int(sx), int(sy)
+            if 0 <= ix < w and 0 <= iy < h and hmap[iy, ix] > sea_level_norm and temp_c[iy, ix] > 0:
+                particles_xy[i, 0], particles_xy[i, 1] = sx, sy
+                break
 
     # Main simulation loop
     for _ in range(simulation_duration):
@@ -158,15 +265,14 @@ def _run_river_simulation_numba(hmap, sea_level_norm, flow_field_angles, particl
         for i in range(particle_count):
             # Check if particle has exceeded max steps OR terminated (e.g. hit sea)
             if particle_steps[i] >= max_steps:
-                # --- Re-spawning logic: Find a new spot on land ---
+                # Re-spawn using the probability map
                 while True:
-                    nx, ny = np.random.uniform(0, w), np.random.uniform(0, h)
-                    nix, niy = int(nx), int(ny)
-                    # Check bounds and land condition for new spawn
-                    if 0 <= nix < w and 0 <= niy < h and hmap[niy, nix] > sea_level_norm:
-                        particles_xy[i, 0], particles_xy[i, 1] = nx, ny
-                        particle_steps[i] = 0 # Reset steps for the new life
-                        break # Found a valid spawn spot, continue to next particle
+                    sx, sy = sample_spawn()
+                    nix, niy = int(sx), int(sy)
+                    if 0 <= nix < w and 0 <= niy < h and hmap[niy, nix] > sea_level_norm and temp_c[niy, nix] > 0:
+                        particles_xy[i, 0], particles_xy[i, 1] = sx, sy
+                        particle_steps[i] = 0
+                        break
                 # If re-spawned, skip the movement for this iteration
                 continue
 
@@ -215,8 +321,8 @@ def _run_river_simulation_numba(hmap, sea_level_norm, flow_field_angles, particl
             while True:
                 # Deposit at the current cell in the line drawing algorithm
                 # Check bounds before depositing
-                if 0 <= y0 < h and 0 <= x0 < w:
-                     image_data[y0, x0] += 0.05 # Deposition amount
+                if 0 <= y0 < h and 0 <= x0 < w and temp_c[y0, x0] > 0:
+                     image_data[y0, x0] += 0.05
 
                 # Check if we reached the end point of the line segment
                 if x0 == x1 and y0 == y1:
@@ -249,10 +355,14 @@ def generate_flow_field_rivers(hmap, params):
     sea_level = params.get('sea_level', 0.4)
     flow_field_angles = calculate_flow_field(hmap, params)
     # Correct parameter order for the numba simulation helper
+    temp_dummy = np.full_like(hmap, 20.0, dtype=np.float32)
+    cdf = np.linspace(0, 1, h * w)
     deposition_map = _run_river_simulation_numba(
         hmap,
         sea_level,
         flow_field_angles,
+        temp_dummy,
+        cdf,
         params["particle_count"],
         params["particle_steps"],
         params["particle_fade"],
@@ -274,13 +384,14 @@ def generate_flow_field_rivers(hmap, params):
     rgba_data[..., 3] = alpha
     return {"image": Image.fromarray(rgba_data), "diagnostics": {"river_flow_angles": flow_field_angles, "river_deposition": deposition_map}}
 
-def generate_world_data(params):
+def generate_world_data(params, scaling_manager):
         w, h = params["size"], params["size"]
         ms = params["seed"]
         diagnostic_maps = {}
 
         # --- Generate Base Maps ---
-        tsm, pp, pv = generate_tectonic_map(w, h, params["plate_points"], ms)
+        tsm, pp, pv, plate_mask = generate_tectonic_map(w, h, params["plate_points"], ms)
+        diagnostic_maps["0_plate_mask"] = plate_mask.copy()
         diagnostic_maps["1_tectonic_potential"] = tsm.copy()
         if params["tectonic_smoothing"] > 0:
             tsm = gaussian_filter(tsm, sigma=params["tectonic_smoothing"])
@@ -306,6 +417,15 @@ def generate_world_data(params):
 
         diagnostic_maps["6_raw_combined_heightmap"] = hm.copy()
         final_map = normalize_map(hm)
+        final_map = earthlike(
+            final_map,
+            plate_mask,
+            params.get("world_diameter_km", 12000),
+            params.get("hypsometric_strength", 1.0),
+            oversample=1.5,
+            seed=ms,
+        )
+        diagnostic_maps["6b_earthlike_heightmap"] = final_map.copy()
 
 
         # --- Calculate Base Flow Field (used for rivers and rain shadow) ---
@@ -317,7 +437,7 @@ def generate_world_data(params):
         # --- Calculate River Deposition Map ---
         # This is also calculated as part of the initial world data
         # Ensure hmap, flow_angles, and params are passed
-        river_deposition_data = calculate_river_deposition(final_map, flow_angles, params)
+        river_deposition_data = calculate_river_deposition(final_map, flow_angles, params, scaling_manager)
         river_deposition_map = river_deposition_data['deposition_map']
         diagnostic_maps.update(river_deposition_data.get("diagnostics", {})) # Add river diagnostics
 
@@ -329,6 +449,7 @@ def generate_world_data(params):
             "heightmap": final_map,
             "plate_points": pp,
             "plate_velocities": pv,
+            "plate_mask": plate_mask,
             "flow_angles": flow_angles, # Return base flow angles
             "river_deposition_map": river_deposition_map, # Return deposition map
             "biome_override_map": override,
@@ -338,31 +459,58 @@ def generate_world_data(params):
 # --- New function to calculate river deposition ---
 # Extracted the calculation part from the old generate_flow_field_rivers
 # It takes hmap and flow_field_angles as inputs now
-def calculate_river_deposition(hmap, flow_field_angles, params):
+def calculate_river_deposition(hmap, flow_field_angles, params, scaling_manager, temp_map_kelvin=None):
      """
      Runs the particle simulation to determine river deposition paths.
      Takes hmap and flow_field_angles as input.
      Particles are spawned on land and terminate in the sea.
      """
      h, w = hmap.shape
-     sea_level_norm = params.get('sea_level', 0.4) # Get sea level from params
+     sea_level_norm = params.get('sea_level', 0.4)
 
-     # This function assumes flow_field_angles is already calculated
+     temp_c = np.full_like(hmap, 20.0, dtype=np.float32)
+     if temp_map_kelvin is not None:
+         temp_c = temp_map_kelvin - KELVIN_TO_CELSIUS_OFFSET
 
-     # Existing river particle simulation logic (_run_river_simulation_numba)
+     height_m = scaling_manager.to_real(np.maximum(hmap - sea_level_norm, 0))
+     dist_px = distance_transform_edt(hmap <= sea_level_norm)
+     km_per_pixel = params.get('world_diameter_km', 12000) / w if w > 0 else 1.0
+     dist_km = dist_px * km_per_pixel
+
+     temp_factor = cc_rainfall_multiplier(temp_c)
+     spawn_prob = temp_factor * 0.63
+     spawn_prob *= (1.0 + 0.0013 * np.minimum(height_m, 2000.0))
+     spawn_prob *= 1.0 / (1.0 + np.exp((height_m - 2000.0) / 400.0))
+     spawn_prob *= np.exp(-dist_km / 150.0)
+     spawn_prob[(temp_c <= 0) | (hmap <= sea_level_norm)] = 0
+
+     flat = spawn_prob.ravel()
+     s = flat.sum()
+     if s > 0:
+         cdf = np.cumsum(flat / s)
+     else:
+         cdf = np.linspace(0, 1, flat.size)
+
      deposition_map = _run_river_simulation_numba(
-          hmap, # Pass hmap
-          sea_level_norm, # Pass sea_level_norm
-          flow_field_angles, # Use the passed flow_field_angles
+          hmap,
+          sea_level_norm,
+          flow_field_angles,
+          temp_c,
+          cdf,
           params["particle_count"],
           params["particle_steps"],
           params["particle_fade"],
-          params["particle_steps"] // 2, # simulation_duration (original logic)
-          1.0 # step_length (original logic)
+          params["particle_steps"] // 2,
+          1.0
      )
-     # The output deposition_map is the raw accumulated value
-     # The visual processing (power, alpha, clipping) is moved to create_river_image
-     return {"deposition_map": deposition_map, "diagnostics": {"river_deposition_raw": deposition_map.copy()}} # Return copy for diagnostics
+     deposition_map[temp_c <= 0] = 0
+     return {
+         "deposition_map": deposition_map,
+         "diagnostics": {
+             "river_deposition_raw": deposition_map.copy(),
+             "river_spawn_probability": spawn_prob,
+         },
+     }
 
 def create_river_image(deposition_map, land_mask):
         """
@@ -514,6 +662,8 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     and a height/wind-based rain shadow effect.
     """
     h, w = hmap.shape
+    temp_c = temp_map_kelvin - KELVIN_TO_CELSIUS_OFFSET
+    sigma_factor = cc_rainfall_multiplier(np.mean(temp_c))
     sea_level_norm = params.get('sea_level', 0.4)
     world_diameter_km = params.get('world_diameter_km', 12000) # Default 12000 km if not set
     global_rainfall_target = params.get('global_rainfall', 985.5) # Default 985.5 mm/yr if not set
@@ -529,10 +679,10 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     # 1. Calculate Sea Blur Sigma and blur the sea mask
     # Interpretation: Sigma is (135 km / World Diameter km) * Map Width (pixels)
     # This makes the pixel sigma scale with the map size for a constant 'real world' distance
-    sea_blur_sigma_km_base = 135.0
+    sea_blur_sigma_km_base = 400.0
     # Avoid division by zero if world_diameter_km is 0 or tiny
     sea_blur_sigma_pixels = (sea_blur_sigma_km_base / world_diameter_km) * w if world_diameter_km > 1e-9 and w > 0 else 1.0
-    sea_blur_sigma_pixels = max(0.1, sea_blur_sigma_pixels) # Ensure minimum sigma
+    sea_blur_sigma_pixels = max(0.1, sea_blur_sigma_pixels) * sigma_factor
 
     # Create initial sea mask (float 0-1)
     sea_mask_float = (hmap <= sea_level_norm).astype(np.float32)
@@ -542,7 +692,10 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     blurred_sea_moisture = gaussian_filter(sea_mask_float, sigma=sea_blur_sigma_pixels, mode='wrap')
 
     # Add blurred sea moisture as diagnostic
-    diagnostic_maps = {"rainfall_blurred_sea": blurred_sea_moisture.copy()}
+    diagnostic_maps = {
+        "rainfall_blurred_sea": blurred_sea_moisture.copy(),
+        "rainfall_blurred_ocean": blurred_sea_moisture.copy(),
+    }
 
 
     # 2. Calculate Rain Shadow Map
@@ -629,9 +782,10 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     else:
          # Normalize raw deposition map first for consistent scaling
          normalized_raw_deposition = normalize_map(river_deposition_map)
+         normalized_raw_deposition[normalized_raw_deposition > 0.1] = (1/0.35)
          # River blur sigma is 1/3rd of the sea blur sigma
          river_blur_sigma_pixels = sea_blur_sigma_pixels / 3.0
-         river_blur_sigma_pixels = max(0.1, river_blur_sigma_pixels) # Ensure minimum sigma
+         river_blur_sigma_pixels = max(0.1, river_blur_sigma_pixels) * sigma_factor
          # Apply Gaussian blur to normalized river deposition map
          # Use mode='wrap'
          blurred_river_moisture = gaussian_filter(normalized_raw_deposition, sigma=river_blur_sigma_pixels, mode='wrap')
@@ -647,25 +801,25 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     # 4. Combine Blurred Maps
     # Total moisture influence is sum of sea moisture (after shadow) and river moisture
     total_moisture_influence = sea_moisture_after_shadow + blurred_river_moisture
-
-    # Add total influence as diagnostic
     diagnostic_maps["rainfall_total_influence"] = total_moisture_influence.copy()
 
+    # Temperature factor for each pixel
+    cc_factor_map = cc_rainfall_multiplier(temp_c)
 
-    # 5. Scale to Global Rainfall Target
-    # Calculate the average value of the total_moisture_influence map
-    average_influence = np.mean(total_moisture_influence)
+    # Apply Clausius-Clapeyron scaling to moisture influence
+    intensity_map = total_moisture_influence * cc_factor_map
+    diagnostic_maps["rainfall_intensity_raw"] = intensity_map.copy()
 
+    # Clip intensities so values >1 do not receive disproportionate rain
+    clipped_intensity = np.clip(intensity_map, 0, 1)
+    diagnostic_maps["rainfall_intensity_clipped"] = clipped_intensity.copy()
+
+    total_weight = clipped_intensity.sum()
     final_rainfall_map = np.zeros_like(hmap, dtype=np.float32)
-    if average_influence > 1e-9:
-         # We want the average rainfall over the map to be global_rainfall_target (mm/yr)
-         # Scaling Factor = global_rainfall_target / Average Influence
-         scaling_factor = global_rainfall_target / average_influence
-         final_rainfall_map = total_moisture_influence * scaling_factor
-    else:
-         # If average influence is zero, rainfall is zero everywhere
-         pass # final_rainfall_map is already zeros
-
+    if total_weight > 1e-9:
+        scale = global_rainfall_target * clipped_intensity.size / total_weight
+        final_rainfall_map = clipped_intensity * scale
+    # else remain zeros
 
     # Ensure final rainfall is non-negative
     final_rainfall_map = np.maximum(0, final_rainfall_map)

@@ -40,6 +40,7 @@ class MapGeneratorApp:
             "plate_points": tk.IntVar(value=12),
             "uplift_magnitude": tk.DoubleVar(value=0.6),
             "tectonic_smoothing": tk.DoubleVar(value=3.0),
+            "hypsometric_strength": tk.DoubleVar(value=1.0),
             "ridge_strength": tk.DoubleVar(value=0.4),
             "ridge_scale": tk.DoubleVar(value=60.0),
             "ridge_octaves": tk.IntVar(value=6),
@@ -153,6 +154,12 @@ class MapGeneratorApp:
         canvas_frame.columnconfigure(0, weight=1)
         self.map_canvas = ZoomableCanvas(canvas_frame, background="#282828", highlightthickness=0)
         self.map_canvas.grid(row=0, column=0, sticky="nsew")
+        self.map_canvas.set_offset_update_callback(lambda r: self.scroll_x.set(r))
+        self.scroll_x = tk.DoubleVar(value=0.0)
+        self.scrollbar_x = ttk.Scale(canvas_frame, orient="horizontal", variable=self.scroll_x,
+                                     command=lambda v: self.map_canvas.set_x_offset_ratio(float(v)))
+        self.scrollbar_x.grid(row=1, column=0, sticky="ew")
+        canvas_frame.rowconfigure(1, weight=0)
 
         right_notebook = ttk.Notebook(main_pane)
         main_pane.add(right_notebook, weight=1)
@@ -366,7 +373,10 @@ class MapGeneratorApp:
         dx, dy = e.x - self.pan_last_x, e.y - self.pan_last_y
         self.map_canvas.pan(dx, dy)
         self.pan_last_x, self.pan_last_y = e.x, e.y
-    def on_zoom(self, e): self.map_canvas.zoom(e)
+        self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
+    def on_zoom(self, e):
+        self.map_canvas.zoom(e)
+        self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
     def on_paint_move(self, e):
         if self.is_painting:
             self._apply_brush(e)
@@ -902,6 +912,7 @@ class MapGeneratorApp:
         self.create_control_slider(lf_tec, "Plate Count:", self.vars["plate_points"], 4, 50, "Plate Count", True)
         self.create_control_slider(lf_tec, "Uplift:", self.vars["uplift_magnitude"], 0.0, 2.0, "Tectonic Uplift")
         self.create_control_slider(lf_tec, "Smoothing:", self.vars["tectonic_smoothing"], 0.0, 10.0, "Tectonic Smoothing")
+        self.create_control_slider(lf_tec, "Hypsometry:", self.vars["hypsometric_strength"], 0.5, 1.5, "Hypsometric Strength")
         self.create_control_slider(lf_tec, "Ridge Str:", self.vars["ridge_strength"], 0.0, 1.5, "Ridge Strength")
         self.create_control_slider(lf_tec, "Ridge Scale:", self.vars["ridge_scale"], 10.0, 200.0, "Ridge Scale")
         self.create_control_slider(lf_tec, "Ridge Detail:", self.vars["ridge_octaves"], 1, 8, "Ridge Detail", True)
@@ -1130,6 +1141,19 @@ class MapGeneratorApp:
                  except Exception as e:
                       print(f"Error applying final temperature blur: {e}")
                       # Continue without blur if it fails
+
+            # Recalculate river deposition with temperature constraints
+            self.status_var.set("Simulating climate (3.7/5): Updating Rivers..."); self.root.update_idletasks()
+            river_deposition_data = gen.calculate_river_deposition(
+                 hmap,
+                 flow_angles,
+                 params,
+                 self.scaling_manager,
+                 self.last_gen_data['temperature_map']
+            )
+            river_deposition_map = river_deposition_data['deposition_map']
+            self.last_gen_data['river_deposition_map'] = river_deposition_map
+            self.last_gen_data.setdefault("diagnostic_maps", {}).update(river_deposition_data.get("diagnostics", {}))
 
 
             # Step 4: Calculate Rainfall Map (NEW LOGIC)
@@ -1515,7 +1539,13 @@ class MapGeneratorApp:
 
         # Recalculate deposition based on current hmap and flow angles using *current* UI parameters
         # Pass a dictionary of current parameter values
-        river_deposition_data = gen.calculate_river_deposition(hmap, flow_angles, {k: v.get() for k, v in self.vars.items()})
+        river_deposition_data = gen.calculate_river_deposition(
+            hmap,
+            flow_angles,
+            {k: v.get() for k, v in self.vars.items()},
+            self.scaling_manager,
+            self.last_gen_data.get("temperature_map")
+        )
         river_deposition_map = river_deposition_data['deposition_map']
         # Store the newly calculated deposition map
         self.last_gen_data['river_deposition_map'] = river_deposition_map
@@ -1654,7 +1684,7 @@ class MapGeneratorApp:
         # Puts result or exception into the queue q
         try:
             # generate_world_data now calculates base maps, flow angles, and river deposition map
-            world_data = gen.generate_world_data(params)
+            world_data = gen.generate_world_data(params, self.scaling_manager)
             q.put(world_data) # Put the successful result into the queue
         except Exception as e:
             # Catch any exceptions during generation and put them into the queue
@@ -1745,12 +1775,13 @@ class MapGeneratorApp:
         # Updates self.last_gen_data with image objects (_image, _layer, _tinted)
         # Calls update_display at the end
         if "heightmap" not in self.last_gen_data or self.last_gen_data["heightmap"] is None:
-             # No heightmap to base visuals on
-             self.status_var.set("No heightmap data to generate visuals.");
-             self.map_canvas.set_image(Image.new("RGBA", (512, 512), (0, 0, 0, 0))) # Set a blank image
-             self.map_canvas.fit_to_screen()
-             self._show_initial_message() # Show initial message
-             return # Cannot regenerate visuals without heightmap
+            # No heightmap to base visuals on
+            self.status_var.set("No heightmap data to generate visuals.")
+            self.map_canvas.set_image(Image.new("RGBA", (512, 512), (0, 0, 0, 0)))  # blank image
+            self.map_canvas.fit_to_screen()
+            self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
+            self._show_initial_message()  # Show initial message
+            return  # Cannot regenerate visuals without heightmap
 
         self.status_var.set("Regenerating visuals..."); # Update status bar
         self.root.update_idletasks() # Force UI update
@@ -1885,39 +1916,52 @@ class MapGeneratorApp:
         # --- Diagnostic Map Display ---
         # If diagnostic view is enabled and a diagnostic map image is available, display it directly
         if self.vars["show_diagnostic_map"].get():
-             selected_map_name = self.vars["selected_diagnostic_map"].get()
-             if selected_map_name in self.diagnostic_images and self.diagnostic_images[selected_map_name] is not None:
-                 diagnostic_image = self.diagnostic_images[selected_map_name]
-                 self.map_canvas.set_image(diagnostic_image)
-                 if is_new_generation: self.map_canvas.fit_to_screen()
-                 else: self.map_canvas.redraw()
+            selected_map_name = self.vars["selected_diagnostic_map"].get()
+            if (
+                selected_map_name in self.diagnostic_images
+                and self.diagnostic_images[selected_map_name] is not None
+            ):
+                diagnostic_image = self.diagnostic_images[selected_map_name]
+                self.map_canvas.set_image(diagnostic_image)
+                if is_new_generation:
+                    self.map_canvas.fit_to_screen()
+                    self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
+                else:
+                    self.map_canvas.redraw()
 
-                 # Update status bar with specific diagnostic value under cursor
-                 # This requires the raw data array for the diagnostic map
-                 diag_data_map = self.last_gen_data.get("diagnostic_maps", {}).get(selected_map_name)
-                 if diag_data_map is not None and diag_data_map.shape == self.last_gen_data["heightmap"].shape:
-                       # Get mouse position relative to canvas window
-                       mouse_x, mouse_y = self.root.winfo_pointerx() - self.map_canvas.winfo_rootx(), self.root.winfo_pointery() - self.map_canvas.winfo_rooty()
-                       # Convert canvas coordinates to world coordinates
-                       mx, my = self.map_canvas.canvas_to_world(mouse_x, mouse_y)
-                       h, w = self.last_gen_data["heightmap"].shape
-                       # Check if world coordinates are within map bounds
-                       if 0 <= mx < w and 0 <= my < h:
-                            ix, iy = int(mx), int(my)
-                            # Get the value from the data array at integer coordinates
-                            value = diag_data_map[iy, ix]
-                            # Format value based on potential type (int or float) - use general formatting
-                            value_str = f"{value:.4f}" if isinstance(value, (float, np.floating)) else str(value)
-                            self.status_var.set(f"Diagnostic: {selected_map_name} | X: {ix}, Y: {iy} | Value: {value_str} | Zoom: {self.map_canvas.zoom_level:.2f}x")
-                       else:
-                             # Mouse is outside map bounds
-                             self.status_var.set(f"Diagnostic: {selected_map_name} | Zoom: {self.map_canvas.zoom_level:.2f}x")
-                 else:
-                       # Data array not available or shape mismatch
-                       self.status_var.set(f"Diagnostic: {selected_map_name} | (Data N/A) | Zoom: {self.map_canvas.zoom_level:.2f}x")
+                # Update status bar with specific diagnostic value under cursor
+                diag_data_map = self.last_gen_data.get("diagnostic_maps", {}).get(
+                    selected_map_name
+                )
+                if (
+                    diag_data_map is not None
+                    and diag_data_map.shape == self.last_gen_data["heightmap"].shape
+                ):
+                    # Get mouse position relative to canvas window
+                    mouse_x = self.root.winfo_pointerx() - self.map_canvas.winfo_rootx()
+                    mouse_y = self.root.winfo_pointery() - self.map_canvas.winfo_rooty()
+                    # Convert canvas coordinates to world coordinates
+                    mx, my = self.map_canvas.canvas_to_world(mouse_x, mouse_y)
+                    h, w = self.last_gen_data["heightmap"].shape
+                    if 0 <= mx < w and 0 <= my < h:
+                        ix, iy = int(mx), int(my)
+                        value = diag_data_map[iy, ix]
+                        value_str = (
+                            f"{value:.4f}" if isinstance(value, (float, np.floating)) else str(value)
+                        )
+                        self.status_var.set(
+                            f"Diagnostic: {selected_map_name} | X: {ix}, Y: {iy} | Value: {value_str} | Zoom: {self.map_canvas.zoom_level:.2f}x"
+                        )
+                    else:
+                        self.status_var.set(
+                            f"Diagnostic: {selected_map_name} | Zoom: {self.map_canvas.zoom_level:.2f}x"
+                        )
+                else:
+                    self.status_var.set(
+                        f"Diagnostic: {selected_map_name} | (Data N/A) | Zoom: {self.map_canvas.zoom_level:.2f}x"
+                    )
 
-
-                 return # Exit the function after showing diagnostic
+                return  # Exit the function after showing diagnostic
 
 
         # --- Layer Compositing Display ---
@@ -2004,6 +2048,7 @@ class MapGeneratorApp:
         # Redraw the canvas or fit to screen for a new generation
         if is_new_generation:
              self.map_canvas.fit_to_screen()
+             self.scroll_x.set(self.map_canvas.get_x_offset_ratio())
         else:
              self.map_canvas.redraw() # Just redraw with current zoom/pan
 
