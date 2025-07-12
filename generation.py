@@ -249,7 +249,7 @@ def earthlike(
     else:
         shaped = shaped_hi
 
-# Determine sea level percentile so the correct land fraction remains
+# Determine provisional sea level percentile for coastal taper
     sea_thresh = dynamic_sea_level(shaped, ocean_fraction=sea_level)
 # Feather coastal zones toward sea level before the CDF remap
     land_mask = shaped > sea_thresh
@@ -263,16 +263,26 @@ def earthlike(
     )
 
     # Apply Earth-like CDF mapping after down-sampling
-    # Apply separate ocean and land hypsometry curves
-    ocean_curve, land_curve = build_earthlike_curves(sea_thresh, max_height_m)
-    shaped = earthlike_remap(shaped, land_mask, ocean_curve, land_curve, sea_thresh, max_height_m, seed)
+    # --- Remap only the large-scale component ---
+    lp_sigma_km = 200.0
+    sigma_lp_px = max(1.0, (lp_sigma_km / world_diameter_km) * shaped.shape[1])
+    lowpass = gaussian_filter(shaped, sigma_lp_px)
+    hires = shaped - lowpass
 
-# Re-align the percentile so the desired land fraction remains
+    ocean_curve, land_curve = build_earthlike_curves(sea_level, max_height_m)
+    remapped = lowpass.copy()
+    remapped[~land_mask] = partial_remap(remapped[~land_mask], ocean_curve, 1.0)
+    remapped[land_mask] = partial_remap(remapped[land_mask], land_curve, 1.0)
+
+    shaped = ADHERENCE * remapped + (1.0 - ADHERENCE) * lowpass
+    shaped += hires
+
+    # Re-align percentile after remap so ocean fraction stays consistent
     new_thresh = np.percentile(shaped, 100.0 * sea_level)
-    delta = sea_thresh - new_thresh
+    delta = sea_level - new_thresh
     shaped += delta
     shaped = np.clip(shaped, 0.0, 1.0)
-    
+
     shaped = 0.5 + cdf_factor * (shaped - 0.5)
     return np.clip(shaped, 0.0, 1.0)
 
