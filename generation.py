@@ -134,21 +134,6 @@ def meters_to_norm(h_m, sea_level, max_h_m, min_depth_m=-11000.0):
     else:
         return sea_level * (h_m - min_depth_m) / (0.0 - min_depth_m)
 
-def residual_gain(dist_km, depth_m):
-    """Return 0..1 scaling for the high-frequency residual based on coast distance and depth."""
-    inland = np.clip(dist_km / 120.0, 0.0, 1.0)
-    shallow = np.clip(-depth_m / 50.0, 0.0, 1.0)
-    deep = 1.0 - np.clip((-depth_m - 50.0) / 550.0, 0.0, 1.0)
-    water = np.where(depth_m >= -50.0, shallow, deep)
-    return np.where(depth_m >= 0.0, inland, water)
-
-def norm_to_meters(val, sea_level, max_h_m, min_depth_m=-11000.0):
-    """Convert a normalized elevation back to metres relative to sea level."""
-    if val >= sea_level:
-        return (val - sea_level) / (1.0 - sea_level) * max_h_m
-    else:
-        return min_depth_m + (val / sea_level) * (0.0 - min_depth_m)
-
 def build_earthlike_curves(sea_level, max_h_m):
     """Return ocean/land CDF curves normalised to 0..1."""
     vfunc = np.vectorize(meters_to_norm)
@@ -219,7 +204,7 @@ def earthlike(
     micro_relief_amp=0.03,
     sea_level=SEA_LEVEL,
     seed=0,
-    elevation_range_m=19848.0,
+    max_height_m=8848.0,
 ):
     """Smooth heightmap interiors and remap elevations to an Earth-like CDF."""
 
@@ -284,36 +269,18 @@ def earthlike(
     lowpass = gaussian_filter(shaped, sigma_lp_px)
     hires = shaped - lowpass
 
-    ocean_curve, land_curve = build_earthlike_curves(sea_level, elevation_range_m)
+    ocean_curve, land_curve = build_earthlike_curves(sea_level, max_height_m)
     remapped = lowpass.copy()
     remapped[~land_mask] = partial_remap(remapped[~land_mask], ocean_curve, 1.0)
     remapped[land_mask] = partial_remap(remapped[land_mask], land_curve, 1.0)
 
     shaped = ADHERENCE * remapped + (1.0 - ADHERENCE) * lowpass
-    # Add high-frequency residual scaled by depth- and distance-aware envelope
-    land_mask_final = shaped > sea_level
-    coast_px = distance_transform_edt(~land_mask_final)
-    coast_km = coast_px * km_per_px
-    depth_m = np.vectorize(norm_to_meters)(shaped, sea_level, elevation_range_m)
-    gain = residual_gain(coast_km, depth_m)
-    shaped = lowpass + gain * hires
+    shaped += hires
 
     # Re-align percentile after remap so ocean fraction stays consistent
     new_thresh = np.percentile(shaped, 100.0 * sea_level)
     delta = sea_level - new_thresh
     shaped += delta
-    shaped = np.clip(shaped, 0.0, 1.0)
-
-# Soften remaining noise in deep water
-    lowpass2 = gaussian_filter(shaped, sigma_lp_px)
-    hires2 = shaped - lowpass2
-    depth_m2 = np.vectorize(norm_to_meters)(shaped, sea_level, elevation_range_m)
-    gain2 = residual_gain(coast_km, depth_m2)
-    shaped = lowpass2 + gain2 * hires2
-
-    # Final percentile alignment and strength scaling
-    new_thresh = np.percentile(shaped, 100.0 * sea_level)
-    shaped += sea_level - new_thresh
     shaped = np.clip(shaped, 0.0, 1.0)
 
     shaped = 0.5 + cdf_factor * (shaped - 0.5)
@@ -646,7 +613,7 @@ def generate_world_data(params, scaling_manager):
             params.get("world_diameter_km", 12000),
             params.get("hypsometric_strength", 1.0),
             sea_level=params.get("sea_level", SEA_LEVEL),
-            elevation_range_m=params.get("elevation_range_m", 19848),
+            max_height_m=params.get("max_world_height_m", 8848),
         )
         diagnostic_maps["6b_earthlike_heightmap"] = final_map.copy()
 
@@ -914,11 +881,7 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     blurred_sea_moisture = gaussian_filter(sea_mask_float, sigma=sea_blur_sigma_pixels, mode='wrap')
 
     # Add blurred sea moisture as diagnostic
-    diagnostic_maps = {
-        "rainfall_blurred_sea": blurred_sea_moisture.copy(),
-        "precipitation_ocean_blur": blurred_sea_moisture.copy(),
-    }
-
+    diagnostic_maps = {"rainfall_blurred_sea": blurred_sea_moisture.copy()}
 
 
     # 2. Calculate Rain Shadow Map
@@ -930,8 +893,8 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     hmap_above_sea_norm = np.maximum(0, hmap - sea_level_norm)
     # Use the scaling manager to convert normalized height difference to real meters
     real_height_above_sea_m = scaling_manager.to_real(hmap_above_sea_norm)
-    # Use elevation_range_m from params for the fallback scale if scaling_manager fails
-    height_in_km = real_height_above_sea_m / 1000.0 if real_height_above_sea_m.max() > 1e-9 else hmap_above_sea_norm * params.get('elevation_range_m', 19848) / 1000.0
+    # Use max_world_height_m from params for the fallback scale if scaling_manager fails
+    height_in_km = real_height_above_sea_m / 1000.0 if real_height_above_sea_m.max() > 1e-9 else hmap_above_sea_norm * params.get('max_world_height_m', 8848) / 1000.0
 
 
     # Downhill slope component (positive where wind blows downhill relative to gradient)
@@ -999,30 +962,29 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
 
     # 3. Blur River Deposition Map
     if river_deposition_map is None:
-        print("Warning: River deposition map is None in generate_rainfall_map.")
-        blurred_river_moisture = np.zeros_like(hmap)
-        diagnostic_maps["rainfall_blurred_rivers"] = blurred_river_moisture.copy()
-        diagnostic_maps["precipitation_lake_blur"] = blurred_river_moisture.copy()
+         print("Warning: River deposition map is None in generate_rainfall_map.")
+         blurred_river_moisture = np.zeros_like(hmap)
+         diagnostic_maps["rainfall_blurred_rivers"] = blurred_river_moisture.copy()
     else:
-        # Normalize raw deposition map first for consistent scaling
-        normalized_raw_deposition = normalize_map(river_deposition_map)
-        normalized_raw_deposition[normalized_raw_deposition > 0.01] = 1 / 0.35
-        # River blur sigma is 1/3rd of the sea blur sigma
-        river_blur_sigma_pixels = sea_blur_sigma_pixels / 3.0
-        river_blur_sigma_pixels = max(0.1, river_blur_sigma_pixels) * sigma_factor
-        # Apply Gaussian blur to normalized river deposition map using wrap mode
-        blurred_river_moisture = gaussian_filter(
-            normalized_raw_deposition, sigma=river_blur_sigma_pixels, mode="wrap"
-        )
-        river_influence_strength = 0.5  # Arbitrary scale factor
-        blurred_river_moisture *= river_influence_strength
+         # Normalize raw deposition map first for consistent scaling
+         normalized_raw_deposition = normalize_map(river_deposition_map)
+         normalized_raw_deposition[normalized_raw_deposition > 0.01] = (1/0.35)
+         # River blur sigma is 1/3rd of the sea blur sigma
+         river_blur_sigma_pixels = sea_blur_sigma_pixels / 3.0
+         river_blur_sigma_pixels = max(0.1, river_blur_sigma_pixels) * sigma_factor
+         # Apply Gaussian blur to normalized river deposition map
+         # Use mode='wrap'
+         blurred_river_moisture = gaussian_filter(normalized_raw_deposition, sigma=river_blur_sigma_pixels, mode='wrap')
+         # Normalize the blurred result again? Or just scale it?
+         # Let's scale it to represent its contribution to rainfall
+         river_influence_strength = 0.5 # Arbitrary scale factor for river influence
+         blurred_river_moisture *= river_influence_strength
 
-        # Add blurred river moisture as diagnostic
-        diagnostic_maps["rainfall_blurred_rivers"] = blurred_river_moisture.copy()
-        diagnostic_maps["precipitation_lake_blur"] = blurred_river_moisture.copy()
+         # Add blurred river moisture as diagnostic
+         diagnostic_maps["rainfall_blurred_rivers"] = blurred_river_moisture.copy()
 
 
-    # 4. Combine Blurred Maps
+       # 4. Combine Blurred Maps
     # Total moisture influence is sum of sea moisture (after shadow) and river moisture
     total_moisture_influence = sea_moisture_after_shadow + blurred_river_moisture
     diagnostic_maps["rainfall_total_influence"] = total_moisture_influence.copy()
