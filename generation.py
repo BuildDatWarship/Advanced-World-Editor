@@ -135,20 +135,22 @@ def coastal_taper(h, dist, sea=0.4, h_interior=0.5, width_km=150.0):
     w = logistic(dist, width_km * 0.5, 0.15 * width_km)
     return sea + (1.0 - w) * np.clip(h, sea, h_interior) + w * h
 
-def meters_to_norm(h_m, sea_level, max_h_m, min_depth_m=-11000.0):
-    """Convert a physical elevation to normalized units."""
+def meters_to_norm(h_m, sea_level, elevation_range_m, min_depth_m=-11000.0):
+    """Convert a physical elevation to normalized units using fixed land and ocean ranges."""
+    land_max = elevation_range_m - abs(min_depth_m)
+    ocean_depth = abs(min_depth_m)
     if h_m >= 0:
-        return sea_level + (h_m / max_h_m) * (1.0 - sea_level)
+        return sea_level + (h_m / land_max) * (1.0 - sea_level)
     else:
-        return sea_level * (h_m - min_depth_m) / (0.0 - min_depth_m)
+        return sea_level + (h_m / ocean_depth) * sea_level
 
-def build_earthlike_curves(sea_level, max_h_m):
-    """Return ocean/land CDF curves normalised to 0..1."""
+def build_earthlike_curves(sea_level, elevation_range_m):
+    """Return ocean/land CDF curves normalised to 0..1 using the elevation range."""
     vfunc = np.vectorize(meters_to_norm)
     ocean = EARTHLIKE_OCEAN_CDF_METERS.copy()
     land = EARTHLIKE_LAND_CDF_METERS.copy()
-    ocean[:, 1] = vfunc(ocean[:, 1], sea_level, max_h_m)
-    land[:, 1] = vfunc(land[:, 1], sea_level, max_h_m)
+    ocean[:, 1] = vfunc(ocean[:, 1], sea_level, elevation_range_m)
+    land[:, 1] = vfunc(land[:, 1], sea_level, elevation_range_m)
     return ocean, land
 
 def dynamic_sea_level(raw, ocean_fraction=SEA_LEVEL):
@@ -212,7 +214,7 @@ def earthlike(
     micro_relief_amp=0.03,
     sea_level=SEA_LEVEL,
     seed=0,
-    max_height_m=8848.0,
+    elevation_range_m=19848.0,
 ):
     """Smooth heightmap interiors and remap elevations to an Earth-like CDF."""
 
@@ -277,7 +279,7 @@ def earthlike(
     lowpass = gaussian_filter(shaped, sigma_lp_px)
     hires = shaped - lowpass
 
-    ocean_curve, land_curve = build_earthlike_curves(sea_level, max_height_m)
+    ocean_curve, land_curve = build_earthlike_curves(sea_level, elevation_range_m)
     remapped = lowpass.copy()
     remapped[~land_mask] = partial_remap(remapped[~land_mask], ocean_curve, 1.0)
     remapped[land_mask] = partial_remap(remapped[land_mask], land_curve, 1.0)
@@ -621,7 +623,7 @@ def generate_world_data(params, scaling_manager):
             params.get("world_diameter_km", 12000),
             params.get("hypsometric_strength", 1.0),
             sea_level=params.get("sea_level", SEA_LEVEL),
-            max_height_m=params.get("max_world_height_m", 8848),
+            elevation_range_m=params.get("elevation_range_m", 19848),
         )
         diagnostic_maps["6b_earthlike_heightmap"] = final_map.copy()
 
@@ -755,6 +757,7 @@ def generate_temperature_map(hmap, albedo_map, params, scaling_manager):
     aeval.symtable.update(params) # Add all UI parameters
     aeval.symtable['stefan_boltzmann'] = STEFAN_BOLTZMANN
     aeval.symtable['albedo_mean'] = np.mean(albedo_map)
+    aeval.symtable['to_real'] = scaling_manager.to_real
 
     try:
         # 1. Calculate a GLOBAL AVERAGE base temperature (black-body)
@@ -898,9 +901,12 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     hmap_above_sea_norm = np.maximum(0, hmap - sea_level_norm)
     # Use the scaling manager to convert normalized height difference to real meters
     real_height_above_sea_m = scaling_manager.to_real(hmap_above_sea_norm)
-    # Use max_world_height_m from params for the fallback scale if scaling_manager fails
-    height_in_km = real_height_above_sea_m / 1000.0 if real_height_above_sea_m.max() > 1e-9 else hmap_above_sea_norm * params.get('max_world_height_m', 8848) / 1000.0
-
+    # Use elevation_range_m with fixed land fraction if scaling manager fails
+    if real_height_above_sea_m.max() > 1e-9:
+        height_in_km = real_height_above_sea_m / 1000.0
+    else:
+        land_max = params.get('elevation_range_m', 19848) * (8848.0 / 19848.0)
+        height_in_km = (hmap_above_sea_norm / max(1e-9, 1 - sea_level_norm)) * land_max / 1000.0
 
     # Downhill slope component (positive where wind blows downhill relative to gradient)
     # This calculates the component of the height gradient vector (dx, dy) in the direction of the wind (flow_angles)

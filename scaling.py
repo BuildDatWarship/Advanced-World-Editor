@@ -10,24 +10,40 @@ class ScalingManager:
         self.app = app
 
     def to_real(self, normalized_value):
-        """Converts a 0-1 value to the current real-world unit (m or ft)."""
-        max_height_m = self.app.vars["max_world_height_m"].get()
-        real_val_m = normalized_value * max_height_m
+        """Converts a normalized value to meters using fixed land and ocean ranges."""
+        sea_level = self.app.vars["sea_level"].get()
+        elev_range = self.app.vars["elevation_range_m"].get()
+        land_max = elev_range * (8848.0 / 19848.0)
+        ocean_depth = elev_range - land_max
+
+        arr = np.asarray(normalized_value, dtype=np.float32)
+        above = arr >= sea_level
+        real_val_m = np.empty_like(arr, dtype=np.float32)
+        real_val_m[above] = ((arr[above] - sea_level) / max(1e-9, 1 - sea_level)) * land_max
+        real_val_m[~above] = -((sea_level - arr[~above]) / max(1e-9, sea_level)) * ocean_depth
         if self.app.vars["unit_system"].get() == "Imperial":
             return real_val_m * METERS_TO_FEET
         return real_val_m
 
     def to_normalized(self, real_value):
         """Converts a real-world value (in current units) back to the 0-1 scale."""
-        max_height_m = self.app.vars["max_world_height_m"].get()
-        if max_height_m == 0:
+        elev_range = self.app.vars["elevation_range_m"].get()
+        if elev_range == 0:
             return 0.0
 
         real_val_m = real_value
         if self.app.vars["unit_system"].get() == "Imperial":
             real_val_m = real_value / METERS_TO_FEET
 
-        return np.clip(real_val_m / max_height_m, 0.0, 1.0)
+        sea_level = self.app.vars["sea_level"].get()
+        land_max = elev_range * (8848.0 / 19848.0)
+        ocean_depth = elev_range - land_max
+        arr = np.asarray(real_val_m, dtype=np.float32)
+        above = arr >= 0
+        norm = np.empty_like(arr, dtype=np.float32)
+        norm[above] = sea_level + (arr[above] / land_max) * (1 - sea_level)
+        norm[~above] = sea_level + (arr[~above] / ocean_depth) * sea_level
+        return np.clip(norm, 0.0, 1.0)
 
     def get_unit_suffix(self):
         """Returns the appropriate unit suffix."""
@@ -35,7 +51,7 @@ class ScalingManager:
 
     def get_max_real_height(self):
         """Gets the max world height in the current unit system."""
-        max_m = self.app.vars["max_world_height_m"].get()
+        max_m = self.app.vars["elevation_range_m"].get()
         return (
             max_m
             if self.app.vars["unit_system"].get() == "Metric"
