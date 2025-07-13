@@ -52,7 +52,7 @@ class MapGeneratorApp:
             "flow_scale": tk.DoubleVar(value=0.015),
             "flow_octaves": tk.IntVar(value=4),
             "unit_system": tk.StringVar(value="Metric"),
-            "max_world_height_m": tk.IntVar(value=8848),
+            "elevation_range_m": tk.IntVar(value=19848),
             "river_strength_threshold": tk.DoubleVar(value=0.4),
             "enable_erosion": tk.BooleanVar(value=True),
             "erosion_height_threshold": tk.DoubleVar(value=0.45),
@@ -877,15 +877,15 @@ class MapGeneratorApp:
         cb = ttk.Combobox(f, textvariable=self.vars["unit_system"], values=["Metric", "Imperial"], state="readonly")
         cb.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
         cb.bind("<<ComboboxSelected>>", self._on_unit_or_scale_change)
-        max_h_var = self.vars["max_world_height_m"]
-        label = ttk.Label(f, text="Max Height (m):")
+        max_h_var = self.vars["elevation_range_m"]
+        label = ttk.Label(f, text="Elevation Range (m):")
         label.grid(row=1, column=0, sticky="w", padx=5, pady=5)
         entry = ttk.Entry(f, textvariable=max_h_var)
         entry.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
         entry.bind("<Return>", self._on_unit_or_scale_change)
         entry.bind("<FocusOut>", self._on_unit_or_scale_change)
-        Tooltip(label, "The real-world height (in meters) that corresponds to the maximum map elevation (1.0).")
-        Tooltip(entry, "The real-world height (in meters) that corresponds to the maximum map elevation (1.0).")
+        Tooltip(label, "Total elevation range from deepest trench to tallest peak, in meters.")
+        Tooltip(entry, "Total elevation range from deepest trench to tallest peak, in meters.")
 
 
     def create_properties_controls(self):

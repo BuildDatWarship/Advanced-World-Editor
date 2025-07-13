@@ -11,7 +11,7 @@ class ScalingManager:
 
     def to_real(self, normalized_value):
         """Converts a 0-1 value to the current real-world unit (m or ft)."""
-        max_height_m = self.app.vars["max_world_height_m"].get()
+        max_height_m = self.app.vars["elevation_range_m"].get()
         real_val_m = normalized_value * max_height_m
         if self.app.vars["unit_system"].get() == "Imperial":
             return real_val_m * METERS_TO_FEET
@@ -19,7 +19,7 @@ class ScalingManager:
 
     def to_normalized(self, real_value):
         """Converts a real-world value (in current units) back to the 0-1 scale."""
-        max_height_m = self.app.vars["max_world_height_m"].get()
+        max_height_m = self.app.vars["elevation_range_m"].get()
         if max_height_m == 0:
             return 0.0
 
@@ -35,7 +35,7 @@ class ScalingManager:
 
     def get_max_real_height(self):
         """Gets the max world height in the current unit system."""
-        max_m = self.app.vars["max_world_height_m"].get()
+        max_m = self.app.vars["elevation_range_m"].get()
         return (
             max_m
             if self.app.vars["unit_system"].get() == "Metric"

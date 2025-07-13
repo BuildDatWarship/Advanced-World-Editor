@@ -27,7 +27,7 @@ DEFAULT_FORMULAS = {
 
     "temperature_latitude_gradient_formula": "pole_k + (equator_k - pole_k) * cos(lat_rad)",
     
-    "temperature_lapse_rate_term_formula": "((hmap * max_world_height_m) - (sea_level * max_world_height_m)) / 1000.0 * lapse_rate_c_per_1000m",
+    "temperature_lapse_rate_term_formula": "((hmap * elevation_range_m) - (sea_level * elevation_range_m)) / 1000.0 * lapse_rate_c_per_1000m",
 
     "rainfall_orographic_effect_formula": "-( (cos(flow_angles) * dx) + (sin(flow_angles) * dy) ) * orographic_strength * 1000",
 }
