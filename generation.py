@@ -8,6 +8,7 @@ from scipy.ndimage import (
     map_coordinates,
     distance_transform_edt,
     zoom,
+    convolve,
 )
 from scipy.fft import fft2, ifft2, fftshift
 from scipy.interpolate import PchipInterpolator
@@ -121,6 +122,13 @@ def radial_taper(shape, knee_px, slope=6):
 def logistic(x, mid, spread):
     """Basic logistic function used for smooth blending."""
     return 1.0 / (1.0 + np.exp(-(x - mid) / spread))
+
+def exp_kernel(radius_px, L_px):
+    """Return a normalized exponential-decay kernel."""
+    y, x = np.ogrid[-radius_px:radius_px + 1, -radius_px:radius_px + 1]
+    r = np.hypot(x, y)
+    k = np.exp(-r / float(L_px))
+    return k / k.sum()
 
 def coastal_taper(h, dist, sea=0.4, h_interior=0.5, width_km=150.0):
     """Feather elevations near the coast toward sea level."""
@@ -865,20 +873,17 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
          return {"rainfall_map": np.zeros_like(hmap), "diagnostics": {"rainfall_error": np.ones_like(hmap)}}
 
 
-    # 1. Calculate Sea Blur Sigma and blur the sea mask
-    # Interpretation: Sigma is (400 km / World Diameter km) * Map Width (pixels)
-    # This makes the pixel sigma scale with the map size for a constant 'real world' distance
-    sea_blur_sigma_km_base = 400.0
-    # Avoid division by zero if world_diameter_km is 0 or tiny
-    sea_blur_sigma_pixels = (sea_blur_sigma_km_base / world_diameter_km) * w if world_diameter_km > 1e-9 and w > 0 else 1.0
-    sea_blur_sigma_pixels = max(0.1, sea_blur_sigma_pixels) * sigma_factor
+    # 1. Calculate Sea Blur using an exponential kernel
+    sea_blur_radius_km = 500.0
+    sea_radius_px = (sea_blur_radius_km / world_diameter_km) * w if world_diameter_km > 1e-9 and w > 0 else 1.0
+    sea_radius_px = max(1.0, sea_radius_px) * sigma_factor
+    sea_kernel = exp_kernel(int(sea_radius_px), sea_radius_px)
 
     # Create initial sea mask (float 0-1)
     sea_mask_float = (hmap <= sea_level_norm).astype(np.float32)
 
-    # Apply Gaussian blur to the sea mask
-    # Use mode='wrap' to handle edges for worlds that wrap around
-    blurred_sea_moisture = gaussian_filter(sea_mask_float, sigma=sea_blur_sigma_pixels, mode='wrap')
+    # Apply exponential blur to the sea mask using wrap mode
+    blurred_sea_moisture = convolve(sea_mask_float, sea_kernel, mode='wrap')
 
     # Add blurred sea moisture as diagnostic
     diagnostic_maps = {"rainfall_blurred_sea": blurred_sea_moisture.copy()}
@@ -969,15 +974,15 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
          # Normalize raw deposition map first for consistent scaling
          normalized_raw_deposition = normalize_map(river_deposition_map)
          normalized_raw_deposition[normalized_raw_deposition > 0.01] = (1/0.35)
-         # River blur sigma is 1/3rd of the sea blur sigma
-         river_blur_sigma_pixels = sea_blur_sigma_pixels / 3.0
-         river_blur_sigma_pixels = max(0.1, river_blur_sigma_pixels) * sigma_factor
-         # Apply Gaussian blur to normalized river deposition map
-         # Use mode='wrap'
-         blurred_river_moisture = gaussian_filter(normalized_raw_deposition, sigma=river_blur_sigma_pixels, mode='wrap')
-         # Normalize the blurred result again? Or just scale it?
-         # Let's scale it to represent its contribution to rainfall
-         river_influence_strength = 0.5 # Arbitrary scale factor for river influence
+         # River blur radius in km
+         river_blur_radius_km = 300.0
+         river_radius_px = (river_blur_radius_km / world_diameter_km) * w if world_diameter_km > 1e-9 and w > 0 else 1.0
+         river_radius_px = max(1.0, river_radius_px) * sigma_factor
+         river_kernel = exp_kernel(int(river_radius_px), river_radius_px)
+         # Apply exponential blur to normalized river deposition map
+         blurred_river_moisture = convolve(normalized_raw_deposition, river_kernel, mode='wrap')
+         # Scale river contribution to rainfall
+         river_influence_strength = 0.5  # Arbitrary scale factor for river influence
          blurred_river_moisture *= river_influence_strength
 
          # Add blurred river moisture as diagnostic
