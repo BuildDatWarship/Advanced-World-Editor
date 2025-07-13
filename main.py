@@ -650,11 +650,11 @@ class MapGeneratorApp:
                 # Display height/depth relative to sea level
                 if norm_h > sea_level_norm:
                     # Land: Display height above sea level
-                    display_val = self.scaling_manager.to_real(norm_h - sea_level_norm)
+                    display_val = self.scaling_manager.to_real(norm_h - sea_level_norm, above_sea=True)
                     label = "Height"
                 else:
                     # Water: Display depth below sea level
-                    display_val = self.scaling_manager.to_real(sea_level_norm - norm_h)
+                    display_val = self.scaling_manager.to_real(sea_level_norm - norm_h, above_sea=False)
                     label = "Depth"
 
                 status_str = f"X: {ix}, Y: {iy} | {label}: {display_val:.1f} {unit}"
@@ -720,7 +720,7 @@ class MapGeneratorApp:
                 # Check if the variable name corresponds to height/depth for real conversion
                 # This is a bit fragile, relies on naming convention or knowing which vars are height-related
                 # For now, assume all vars in real_value_controls are height-related 0-1 normalized values
-                real_val = self.scaling_manager.to_real(norm_value)
+                real_val = self.scaling_manager.to_real(norm_value, above_sea=True)
                 entry_var.set(f"{real_val:.1f}")
             except (tk.TclError, ValueError) as e:
                 # Handle cases where the variable might not be a valid number
@@ -829,7 +829,7 @@ class MapGeneratorApp:
         def update_entry_from_scale(*args):
              try:
                   # Convert normalized value to real value using scaling manager
-                  real_val = self.scaling_manager.to_real(norm_var.get())
+                  real_val = self.scaling_manager.to_real(norm_var.get(), above_sea=True)
                   entry_var.set(f"{real_val:.1f}") # Update entry text
              except (tk.TclError, ValueError) as e:
                   print(f"Error converting normalized value {norm_var.get()} to real: {e}")
@@ -840,7 +840,7 @@ class MapGeneratorApp:
                   # Get value from entry, convert to float
                   real_value = float(entry_var.get())
                   # Convert real value to normalized value using scaling manager
-                  norm_value = self.scaling_manager.to_normalized(real_value)
+                  norm_value = self.scaling_manager.to_normalized(real_value, above_sea=True)
                   # Ensure normalized value is within 0-1 range before setting
                   norm_value = max(0.0, min(norm_value, 1.0))
                   norm_var.set(norm_value) # Update the normalized variable, updates slider
@@ -1067,7 +1067,7 @@ class MapGeneratorApp:
             gradient_term = np.clip(gradient_magnitude, 0, 2.0) ** 0.7
             erodibility_map = gen.generate_perlin_noise(w, h, erodibility_scale, erodibility_octaves, seed + 999)
             diag_maps["erosion_erodibility"] = erodibility_map
-            max_erosion_depth_norm = self.scaling_manager.to_normalized(max_erosion_depth_m)
+            max_erosion_depth_norm = self.scaling_manager.to_normalized(max_erosion_depth_m, above_sea=True)
             erosion_map = rainfall_term * gradient_term * erodibility_map * max_erosion_depth_norm
             diag_maps["erosion_amount"] = erosion_map
             hmap -= erosion_map
@@ -1599,7 +1599,8 @@ class MapGeneratorApp:
              final_erosion_mask = erodible_land_mask & (distance_to_river < distance_falloff_range)
 
              # Determine the maximum amount of height to subtract (normalized)
-             max_erosion_depth_norm = self.scaling_manager.to_normalized(self.vars['max_erosion_depth_m'].get())
+             max_erosion_depth_norm = self.scaling_manager.to_normalized(
+                 self.vars['max_erosion_depth_m'].get(), above_sea=True)
 
              # Calculate the actual erosion amount for the masked pixels
              # It scales with the maximum erosion depth and the distance falloff
@@ -1620,7 +1621,7 @@ class MapGeneratorApp:
                   return
 
              # Base carving amount (arbitrary scaling of max erosion depth)
-             carving_amount_base_norm = self.scaling_manager.to_normalized(self.vars['max_erosion_depth_m'].get() / 10.0)
+             carving_amount_base_norm = self.scaling_manager.to_normalized(self.vars['max_erosion_depth_m'].get() / 10.0, above_sea=True)
 
              # Apply carving amount scaled by the river strength *only* where strong rivers are on land
              # The river_strength map has values 0-1, so this scales the base carving amount

@@ -314,7 +314,7 @@ def apply_rainfall_erosion(hmap, params, scaling_manager):
     sigma_px = max(0.1, sigma_px)
     blurred = gaussian_filter(sea_mask, sigma=sigma_px, mode="wrap")
     max_int = blurred.max() if blurred.max() > 0 else 1.0
-    depth_norm = scaling_manager.to_normalized(params.get("max_erosion_depth_m", 250.0))
+    depth_norm = scaling_manager.to_normalized(params.get("max_erosion_depth_m", 250.0), above_sea=True)
     erosion = depth_norm * (blurred / max_int)
     return np.clip(hmap - erosion, 0.0, 1.0)
 
@@ -668,7 +668,7 @@ def calculate_river_deposition(hmap, flow_field_angles, params, scaling_manager,
     if temp_map_kelvin is not None:
         temp_c = temp_map_kelvin - KELVIN_TO_CELSIUS_OFFSET
 
-    height_m = scaling_manager.to_real(np.maximum(hmap - sea_level_norm, 0))
+    height_m = scaling_manager.to_real(np.maximum(hmap - sea_level_norm, 0), above_sea=True)
     dist_px = distance_transform_edt(hmap <= sea_level_norm)
     km_per_pixel = params.get('world_diameter_km', 12000) / w if w > 0 else 1.0
     dist_km = dist_px * km_per_pixel
@@ -900,7 +900,7 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     # Height above sea level in KM (convert normalized height to meters then to km)
     hmap_above_sea_norm = np.maximum(0, hmap - sea_level_norm)
     # Use the scaling manager to convert normalized height difference to real meters
-    real_height_above_sea_m = scaling_manager.to_real(hmap_above_sea_norm)
+    real_height_above_sea_m = scaling_manager.to_real(hmap_above_sea_norm, above_sea=True)
     # Use elevation_range_m with fixed land fraction if scaling manager fails
     if real_height_above_sea_m.max() > 1e-9:
         height_in_km = real_height_above_sea_m / 1000.0
@@ -1115,7 +1115,7 @@ def apply_altitude_tint(biome_image, hmap, sea_level_norm, scaling_manager, temp
 
         # Calculate real height above sea level in meters and then kilometers
         # Use the scaling manager passed from main.py
-        real_height_above_sea_m = scaling_manager.to_real(norm_height_above_sea)
+        real_height_above_sea_m = scaling_manager.to_real(norm_height_above_sea, above_sea=True)
         height_in_km = real_height_above_sea_m / 1000.0
 
 

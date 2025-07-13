@@ -9,24 +9,34 @@ class ScalingManager:
     def __init__(self, app):
         self.app = app
 
-    def to_real(self, normalized_value):
-        """Converts a normalized value to meters using fixed land and ocean ranges."""
+    def to_real(self, normalized_value, above_sea=True):
+        """Converts a normalized distance from sea level to meters.
+
+        Parameters
+        ----------
+        normalized_value : array-like
+            Distance from sea level expressed in the 0-1 normalized space.
+        above_sea : bool, optional
+            If ``True`` the value is treated as height above sea level,
+            otherwise it is interpreted as depth below sea level.
+        """
         sea_level = self.app.vars["sea_level"].get()
         elev_range = self.app.vars["elevation_range_m"].get()
         land_max = elev_range * (8848.0 / 19848.0)
         ocean_depth = elev_range - land_max
 
         arr = np.asarray(normalized_value, dtype=np.float32)
-        above = arr >= sea_level
-        real_val_m = np.empty_like(arr, dtype=np.float32)
-        real_val_m[above] = ((arr[above] - sea_level) / max(1e-9, 1 - sea_level)) * land_max
-        real_val_m[~above] = -((sea_level - arr[~above]) / max(1e-9, sea_level)) * ocean_depth
+        if above_sea:
+            real_val_m = (arr / max(1e-9, 1 - sea_level)) * land_max
+        else:
+            real_val_m = (arr / max(1e-9, sea_level)) * ocean_depth
         if self.app.vars["unit_system"].get() == "Imperial":
             return real_val_m * METERS_TO_FEET
         return real_val_m
 
-    def to_normalized(self, real_value):
-        """Converts a real-world value (in current units) back to the 0-1 scale."""
+    def to_normalized(self, real_value, above_sea=True):
+        """Converts a real-world distance (in current units) to normalized form."""
+
         elev_range = self.app.vars["elevation_range_m"].get()
         if elev_range == 0:
             return 0.0
@@ -38,13 +48,11 @@ class ScalingManager:
         sea_level = self.app.vars["sea_level"].get()
         land_max = elev_range * (8848.0 / 19848.0)
         ocean_depth = elev_range - land_max
-        arr = np.asarray(real_val_m, dtype=np.float32)
-        above = arr >= 0
-        norm = np.empty_like(arr, dtype=np.float32)
-        norm[above] = sea_level + (arr[above] / land_max) * (1 - sea_level)
-        norm[~above] = sea_level + (arr[~above] / ocean_depth) * sea_level
-        return np.clip(norm, 0.0, 1.0)
-
+        
+        scale = land_max if above_sea else ocean_depth
+        frac = np.asarray(real_val_m, dtype=np.float32) / max(1e-9, scale)
+        return np.clip(frac * ((1 - sea_level) if above_sea else sea_level), 0.0, 1.0)
+    
     def get_unit_suffix(self):
         """Returns the appropriate unit suffix."""
         return "m" if self.app.vars["unit_system"].get() == "Metric" else "ft"
