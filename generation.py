@@ -603,10 +603,9 @@ def generate_world_data(params, scaling_manager):
 
         # --- Formula Evaluation for Heightmap ---
         aeval = AstevalInterpreter()
-        aeval.symtable.update(params) # Add all UI parameters
-        aeval.symtable.update({
-            'cm': cm, 'tsm': tsm, 'rm': rm, 'bn': bn,
-        })
+        aeval.symtable.update(params)  # Add all UI parameters
+        aeval.symtable.update({'cm': cm, 'tsm': tsm, 'rm': rm, 'bn': bn})
+        aeval.symtable['np'] = np  # allow formulas to reference np.*
 
         try:
             hm = aeval.eval(params['heightmap_formula'])
@@ -753,8 +752,9 @@ def calculate_albedo_map(biome_indices_map, biomes, hmap, sea_level):
 def generate_temperature_map(hmap, albedo_map, params, scaling_manager):
     # --- Formula Evaluation for Temperature ---
     aeval = AstevalInterpreter(use_numpy=True)
-    aeval.symtable.update(np.__dict__) # give access to numpy functions like cos, deg2rad, etc
-    aeval.symtable.update(params) # Add all UI parameters
+    aeval.symtable.update(np.__dict__)  # give access to numpy functions
+    aeval.symtable['np'] = np  # allow formulas to use np.* syntax
+    aeval.symtable.update(params)  # Add all UI parameters
     aeval.symtable['stefan_boltzmann'] = STEFAN_BOLTZMANN
     aeval.symtable['albedo_mean'] = np.mean(albedo_map)
     aeval.symtable['to_real'] = scaling_manager.to_real
