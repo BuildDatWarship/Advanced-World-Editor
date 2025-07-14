@@ -76,7 +76,7 @@ class MapGeneratorApp:
             "selected_diagnostic_map": tk.StringVar(),
             # --- Geostrophic Wind Variables ---
             "enable_geostrophic_winds": tk.BooleanVar(value=True),
-            "geostrophic_wind_kmh": tk.DoubleVar(value=20.0),
+            "geostrophic_wind_kmh": tk.DoubleVar(value=40.0),
             "geostrophic_blur_sigmas": tk.StringVar(value="2, 4, 8"),
             "geostrophic_advection_steps": tk.IntVar(value=4), # Changed default to 2
             "world_diameter_km": tk.IntVar(value=12000), # Changed default to 12000

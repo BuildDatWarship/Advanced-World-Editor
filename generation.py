@@ -1,5 +1,6 @@
 import numpy as np
 import noise
+import cv2
 from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
 from scipy.ndimage import (
@@ -10,6 +11,7 @@ from scipy.ndimage import (
     zoom,
     convolve,
 )
+from scipy.signal import fftconvolve
 from scipy.fft import fft2, ifft2, fftshift
 from scipy.interpolate import PchipInterpolator
 import numba
@@ -30,16 +32,17 @@ except ModuleNotFoundError:
 EARTHLIKE_OCEAN_CDF_METERS = np.array(
     [
         (0.000, -11000),
-        (0.10, -6000),
-        (0.25, -4800),
-        (0.55, -4300),
-        (0.65, -2500),  # continental slope mid-point
+        (0.02, -8000),  # only the lowest 2 % reach abyssal depth
+        (0.05, -6000),
+        (0.15, -4500),
+        (0.40, -3800),
+        (0.60, -3000),
+        (0.68, -2500),
         (0.70, -600),
-        (0.73, -130),  # shelf break  # sea-level transition
+        (0.73, -130),
     ],
     dtype=np.float32,
 )
-
 EARTHLIKE_LAND_CDF_METERS = np.array(
     [
         (0.00, 0),
@@ -48,7 +51,7 @@ EARTHLIKE_LAND_CDF_METERS = np.array(
         (0.74, 840),
         (0.97, 2000),
         (0.997, 4500),
-        (1.000, 8850),
+        (1.000, 8848),
     ],
     dtype=np.float32,
 )
@@ -97,6 +100,22 @@ def generate_simplex_continents(w: int,
     noise2 = _make_noise2(seed)
     raw   = noise2(X * freq, Y * freq)      # [-1,1]
     return normalize_map(raw)               # [0,1]
+
+# 3.  Small-scale Perlin helper ---------------------------------------------
+def _perlin(shape, freq=0.02, warp=0.0, seed=0):
+    """Return a Perlin/OpenSimplex field in [-1,1] with optional warping."""
+    h, w = shape
+    x = np.arange(w, dtype=np.float32)
+    y = np.arange(h, dtype=np.float32)
+    X, Y = np.meshgrid(x, y)
+
+    noise2 = _make_noise2(seed)
+    if warp != 0.0:
+        warp_noise = _make_noise2(seed + 1)
+        X = X + warp * w * warp_noise(X * freq, Y * freq)
+        Y = Y + warp * h * warp_noise((X + 11.3) * freq, (Y - 7.9) * freq)
+
+    return noise2(X * freq, Y * freq)
 # ---------- end of helper block --------------------------------------------
 
 def hex_to_rgb(h):
@@ -130,6 +149,13 @@ def exp_kernel(radius_px, L_px):
     k = np.exp(-r / float(L_px))
     return k / k.sum()
 
+
+def convolve_wrap_fft(img, kernel):
+    """Convolve using FFT assuming periodic (wrap) boundary."""
+    img = img.astype(np.float32, copy=False)
+    kernel = kernel.astype(np.float32, copy=False)
+    return fftconvolve(img, kernel, mode="same").astype(np.float32)
+
 def coastal_taper(h, dist, sea=0.4, h_interior=0.5, width_km=150.0):
     """Feather elevations near the coast toward sea level."""
     w = logistic(dist, width_km * 0.5, 0.15 * width_km)
@@ -156,6 +182,21 @@ def build_earthlike_curves(sea_level, elevation_range_m):
 def dynamic_sea_level(raw, ocean_fraction=SEA_LEVEL):
     """Return the normalized elevation that yields the requested ocean fraction."""
     return np.percentile(raw, 100.0 * ocean_fraction)
+
+
+def _build_earthlike_cdf(sea_level=SEA_LEVEL, elevation_range_m=19848.0):
+    """Create a single Earth-like CDF for hypsometric remapping."""
+    ocean, land = build_earthlike_curves(sea_level, elevation_range_m)
+    x_ocean = sea_level * ocean[:, 0]
+    x_land = sea_level + (1.0 - sea_level) * land[:, 0]
+    cdf = np.vstack([
+        np.column_stack((x_ocean, ocean[:, 1])),
+        np.column_stack((x_land, land[:, 1])),
+    ])
+    return cdf
+
+
+EARTHLIKE_CDF = _build_earthlike_cdf()
 
 def partial_remap(values, target, adherence=ADHERENCE):
     """Map values to a target CDF while retaining some native variance."""
@@ -209,91 +250,99 @@ def earthlike(
     sigma_edge=1.0,
     sigma_core=12.0,
     blend_km=250.0,
-    oversample=2,
-    taper_knee_px=8,
-    micro_relief_amp=0.03,
+    oversample=1.5,
+    target_cdf=None,
+    taper_knee_px=4,
+    micro_relief_amp=0.06,
     sea_level=SEA_LEVEL,
     seed=0,
     elevation_range_m=19848.0,
 ):
-    """Smooth heightmap interiors and remap elevations to an Earth-like CDF."""
+    """Return a smoothed, Earth-like heightmap in the range [0,1]."""
 
-    # --- Optional oversampling to avoid ringing artefacts ---
-    if oversample > 1:
-        height_hi = zoom(height, oversample, order=3)
-        mask_hi = zoom(plate_mask, oversample, order=0)
+    # ------------------------------------------------------------------ 1 — Optional up-sampling
+    h, w = height.shape
+    if oversample > 1.01:
+        hi_w, hi_h = int(w * oversample), int(h * oversample)
+        hi_height = cv2.resize(height, (hi_w, hi_h), interpolation=cv2.INTER_CUBIC)
+        hi_mask = cv2.resize(plate_mask.astype(np.float32), (hi_w, hi_h), interpolation=cv2.INTER_NEAREST)
     else:
-        height_hi = height
-        mask_hi = plate_mask
+        hi_height = height
+        hi_mask = plate_mask.astype(np.float32)
 
-    dist_px = distance_transform_edt(1 - mask_hi)
-    km_per_px = world_diameter_km / height_hi.shape[1] if height_hi.shape[1] else 1.0
+    if target_cdf is None:
+        target_cdf = _build_earthlike_cdf(sea_level=sea_level, elevation_range_m=elevation_range_m)
 
-    # Smooth blend from plate edges using a logistic ramp
-    dist_km = dist_px * km_per_px
-    w = logistic(dist_km, blend_km / 2.0, max(1.0, blend_km / 10.0))
-    h_edge = gaussian_filter(height_hi, sigma_edge / km_per_px)
-    h_core = gaussian_filter(height_hi, sigma_core / km_per_px)
-    blurred = (1 - w) * h_edge + w * h_core
+    # ------------------------------------------------------------------ 2 — Distance-weighted Gaussian blend from plate centres
+    dist_px = distance_transform_edt(1.0 - hi_mask)
+    km_per_px = world_diameter_km / (w * oversample) if w else 1.0
+    mid, spread = blend_km * 0.5, max(1.0, blend_km / 10.0)
+    w_blend = 1.0 / (1.0 + np.exp(-(dist_px * km_per_px - mid) / spread))
+    h_edge = gaussian_filter(hi_height, sigma_edge / km_per_px)
+    h_core = gaussian_filter(hi_height, sigma_core / km_per_px)
+    blurred = (1.0 - w_blend) * h_edge + w_blend * h_core
 
-    # Spectral shaping with a soft radial taper
-    H, W = blurred.shape
-    kx = fftshift(np.fft.fftfreq(W))[:, None]
-    ky = fftshift(np.fft.fftfreq(H))[None, :]
+    # ------------------------------------------------------------------ 3 — Spectral shaping with soft radial taper
+    H2, W2 = blurred.shape
+    kx = np.fft.fftfreq(W2)[None, :]
+    ky = np.fft.fftfreq(H2)[:, None]
     k = np.sqrt(kx ** 2 + ky ** 2) + 1e-9
-    spec = fft2(blurred)
-    spec *= k ** (spectral_slope / 2.0) * radial_taper(blurred.shape, taper_knee_px * oversample)
-    shaped_hi = np.real(ifft2(spec))
+    spec = np.fft.fftshift(fft2(blurred))
+    spec *= k ** (spectral_slope / 2.0) * radial_taper((H2, W2), knee_px=taper_knee_px)
+    shaped = np.fft.ifft2(np.fft.ifftshift(spec)).real
 
-    # Inject a whisper of micro relief to mask residual grid artefacts
-    noise2 = _make_noise2(seed)
-    x = np.arange(W, dtype=np.float32)
-    y = np.arange(H, dtype=np.float32)
-    X, Y = np.meshgrid(x, y)
-    micro = noise2(X * 0.02, Y * 0.02)
-    shaped_hi += micro_relief_amp * micro
+    # ------------------------------------------------------------------ 4 — Down-sample to the requested resolution
+    if oversample > 1.01:
+        shaped = cv2.resize(shaped, (w, h), interpolation=cv2.INTER_AREA)
 
-    # Downsample with anti-aliasing back to the original resolution
-    if oversample > 1:
-        shaped = zoom(shaped_hi, 1.0 / oversample, order=3)
-    else:
-        shaped = shaped_hi
+    # ------------------------------------------------------------------ 5 — Remap to the Earth-like cumulative distribution
+    if target_cdf is not None:
+        flat = shaped.ravel()
+        ranks = np.argsort(np.argsort(flat))
+        cdf_pos = ranks / float(flat.size - 1)
+        flat = np.interp(cdf_pos, target_cdf[:, 0], target_cdf[:, 1])
+        shaped = flat.reshape(shaped.shape)
 
-# Determine provisional sea level percentile for coastal taper
-    sea_thresh = dynamic_sea_level(shaped, ocean_fraction=sea_level)
-# Feather coastal zones toward sea level before the CDF remap
-    land_mask = shaped > sea_thresh
-    coast_dist_px = distance_transform_edt(~land_mask)
-    coast_dist_px = np.maximum(coast_dist_px - 0.5, 0)
-    coast_dist_km = coast_dist_px * km_per_px
-    shaped = np.where(
-        land_mask,
-        coastal_taper(shaped, coast_dist_km, sea=sea_thresh, h_interior=min(sea_thresh + 0.12, 1.0)),
-        shaped,
-    )
+    # ------------------------------------------------------------------ 6 — Decide what is land after the remap
+    land_mask = shaped > sea_level
 
-    # Apply Earth-like CDF mapping after down-sampling
-    # --- Remap only the large-scale component ---
-    lp_sigma_km = 200.0
-    sigma_lp_px = max(1.0, (lp_sigma_km / world_diameter_km) * shaped.shape[1])
+    # ------------------------------------------------------------------ 7 — Add back high-pass + micro-noise only on land
+    lp_sigma_km = 90.0
+    sigma_lp_px = max(1.0, (lp_sigma_km / world_diameter_km) * w)
     lowpass = gaussian_filter(shaped, sigma_lp_px)
     hires = shaped - lowpass
 
-    ocean_curve, land_curve = build_earthlike_curves(sea_level, elevation_range_m)
-    remapped = lowpass.copy()
-    remapped[~land_mask] = partial_remap(remapped[~land_mask], ocean_curve, 1.0)
-    remapped[land_mask] = partial_remap(remapped[land_mask], land_curve, 1.0)
+    amp = micro_relief_amp * (np.percentile(shaped, 95) - np.percentile(shaped, 5))
+    micro = amp * _perlin(shaped.shape, freq=0.02, warp=0.005, seed=seed)
 
-    shaped = ADHERENCE * remapped + (1.0 - ADHERENCE) * lowpass
-    shaped += hires
+    shaped += (hires + micro) * land_mask
 
-    # Re-align percentile after remap so ocean fraction stays consistent
-    new_thresh = np.percentile(shaped, 100.0 * sea_level)
-    delta = sea_level - new_thresh
+    # ------------------------------------------------------------------ 8 — Re-align the sea-level percentile and feather the coastline
+    delta = sea_level - np.percentile(shaped, 100.0 * sea_level)
     shaped += delta
-    shaped = np.clip(shaped, 0.0, 1.0)
 
+    coast_px = distance_transform_edt(shaped > sea_level)
+    coast_km = coast_px * (world_diameter_km / w)
+    shaped = np.where(
+        shaped > sea_level,
+        coastal_taper(shaped, coast_km, sea=sea_level, h_interior=min(sea_level + 0.12, 1.0)),
+        shaped,
+    )
+
+
+    # ------------------------------------------------------------------ 8b — keep extremes but squeeze them back into 0‒1
+    lo, hi = np.percentile(shaped, (0.05, 99.95))
+    spread = max(1e-6, hi - lo)
+    shaped = (shaped - lo) / spread
+    # ------------------------------------------------------------------ 9 — Final low-key Nyquist roll-off
+    spec = fft2(shaped)
+    spec *= radial_taper(shaped.shape, knee_px=taper_knee_px)
+    shaped = np.real(ifft2(spec))
+
+    # ----------------------------------------------------------------- 10 — Return normalised, clipped result
     shaped = 0.5 + cdf_factor * (shaped - 0.5)
+    lo, hi = np.percentile(shaped, (0.05, 99.95))
+    shaped = (shaped - lo) / (hi - lo + 1e-9)
     return np.clip(shaped, 0.0, 1.0)
 
 # --- Generation Algorithms ---
@@ -886,7 +935,7 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
     sea_mask_float = (hmap <= sea_level_norm).astype(np.float32)
 
     # Apply exponential blur to the sea mask using wrap mode
-    blurred_sea_moisture = convolve(sea_mask_float, sea_kernel, mode='wrap')
+    blurred_sea_moisture = convolve_wrap_fft(sea_mask_float, sea_kernel)
 
     # Add blurred sea moisture as diagnostic
     diagnostic_maps = {"rainfall_blurred_sea": blurred_sea_moisture.copy()}
@@ -977,22 +1026,27 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
          blurred_river_moisture = np.zeros_like(hmap)
          diagnostic_maps["rainfall_blurred_rivers"] = blurred_river_moisture.copy()
     else:
-         # Normalize raw deposition map first for consistent scaling
-         normalized_raw_deposition = normalize_map(river_deposition_map)
-         normalized_raw_deposition[normalized_raw_deposition > 0.01] = (1/0.35)
-         # River blur radius in km
-         river_blur_radius_km = 300.0
-         river_radius_px = (river_blur_radius_km / world_diameter_km) * w if world_diameter_km > 1e-9 and w > 0 else 1.0
-         river_radius_px = max(1.0, river_radius_px) * sigma_factor
-         river_kernel = exp_kernel(int(river_radius_px), river_radius_px)
-         # Apply exponential blur to normalized river deposition map
-         blurred_river_moisture = convolve(normalized_raw_deposition, river_kernel, mode='wrap')
-         # Scale river contribution to rainfall
-         river_influence_strength = 0.5  # Arbitrary scale factor for river influence
-         blurred_river_moisture *= river_influence_strength
+        # Normalize raw deposition map first for consistent scaling
+        normalized_raw_deposition = normalize_map(river_deposition_map)
+        normalized_raw_deposition[normalized_raw_deposition > 0.01] = (1 / 0.35)
+        # River blur radius in km
+        river_blur_radius_km = 300.0
+        river_radius_px = (
+            river_blur_radius_km / world_diameter_km
+        ) * w if world_diameter_km > 1e-9 and w > 0 else 1.0
+        river_radius_px = max(1.0, river_radius_px) * sigma_factor
+        river_kernel = exp_kernel(int(river_radius_px), river_radius_px)
+        # Apply exponential blur to normalized river deposition map
+        blurred_river_moisture = convolve_wrap_fft(
+            normalized_raw_deposition,
+            river_kernel,
+        )
+        # Scale river contribution to rainfall
+        river_influence_strength = 0.5  # Arbitrary scale factor for river influence
+        blurred_river_moisture *= river_influence_strength
 
-         # Add blurred river moisture as diagnostic
-         diagnostic_maps["rainfall_blurred_rivers"] = blurred_river_moisture.copy()
+        # Add blurred river moisture as diagnostic
+        diagnostic_maps["rainfall_blurred_rivers"] = blurred_river_moisture.copy()
 
 
        # 4. Combine Blurred Maps
