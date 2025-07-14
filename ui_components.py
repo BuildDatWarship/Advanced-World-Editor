@@ -14,9 +14,13 @@ class ZoomableCanvas(tk.Canvas):
         self.pil_image = None
         self.tk_image = None
         self.image_id = None
+        self._offset_ratio_update = None
 
     def set_image(self, pil_image):
         self.pil_image = pil_image
+
+    def set_offset_update_callback(self, callback):
+        self._offset_ratio_update = callback
 
     def fit_to_screen(self):
         if not self.pil_image: return
@@ -26,19 +30,32 @@ class ZoomableCanvas(tk.Canvas):
         img_w, img_h = self.pil_image.size
         if canvas_w < 2 or canvas_h < 2 or img_w < 1 or img_h < 1: return
         ratio = min(canvas_w / img_w, canvas_h / img_h) * 0.95
-        self.zoom_level = ratio
-        self.x_offset = (img_w - canvas_w / self.zoom_level) / 2
-        self.y_offset = (img_h - canvas_h / self.zoom_level) / 2
+        self.zoom_level = max(0.1, min(10.0, ratio))
+        self.x_offset = max(0.0, (img_w - canvas_w / self.zoom_level) / 2)
+        self.y_offset = max(0.0, (img_h - canvas_h / self.zoom_level) / 2)
         self.redraw()
 
     def redraw(self):
         if not self.pil_image: return
         canvas_w, canvas_h = self.winfo_width(), self.winfo_height()
         if canvas_w < 2 or canvas_h < 2: return
+        img_w, img_h = self.pil_image.size
+        # Clamp offsets so the crop box stays within the image bounds
+        max_x_off = max(0.0, img_w - canvas_w / self.zoom_level)
+        max_y_off = max(0.0, img_h - canvas_h / self.zoom_level)
+        self.x_offset = min(max(self.x_offset, 0.0), max_x_off)
+        self.y_offset = min(max(self.y_offset, 0.0), max_y_off)
+
         box_x1, box_y1 = self.x_offset, self.y_offset
-        box_x2, box_y2 = self.x_offset + canvas_w / self.zoom_level, self.y_offset + canvas_h / self.zoom_level
+        box_x2 = box_x1 + canvas_w / self.zoom_level
+        box_y2 = box_y1 + canvas_h / self.zoom_level
         cropped_image = self.pil_image.crop((box_x1, box_y1, box_x2, box_y2))
-        resized_image = cropped_image.resize((canvas_w, canvas_h), Image.Resampling.NEAREST)
+        # Use high-quality resampling to avoid aliasing artifacts that look like
+        # a black/white checkerboard when displaying large images at small
+        # scales.
+        resized_image = cropped_image.resize(
+            (canvas_w, canvas_h), Image.Resampling.LANCZOS
+        )
         self.tk_image = ImageTk.PhotoImage(resized_image)
         if self.image_id:
             self.itemconfig(self.image_id, image=self.tk_image)
@@ -46,22 +63,52 @@ class ZoomableCanvas(tk.Canvas):
             self.image_id = self.create_image(0, 0, anchor="nw", image=self.tk_image)
 
     def pan(self, dx, dy):
+        if not self.pil_image:
+            return
+        img_w, img_h = self.pil_image.size
         self.x_offset -= dx / self.zoom_level
         self.y_offset -= dy / self.zoom_level
+        canvas_w, canvas_h = self.winfo_width(), self.winfo_height()
+        max_x_off = max(0.0, img_w - canvas_w / self.zoom_level)
+        max_y_off = max(0.0, img_h - canvas_h / self.zoom_level)
+        self.x_offset = min(max(self.x_offset, 0.0), max_x_off)
+        self.y_offset = min(max(self.y_offset, 0.0), max_y_off)
         self.redraw()
+        if self._offset_ratio_update:
+            self._offset_ratio_update(self.get_x_offset_ratio())
 
     def zoom(self, event):
         if not self.pil_image: return
         factor = 1.1 if event.delta > 0 else 0.9
         world_x_before, world_y_before = self.canvas_to_world(event.x, event.y)
         self.zoom_level *= factor
+        self.zoom_level = max(0.1, min(10.0, self.zoom_level))
         world_x_after, world_y_after = self.canvas_to_world(event.x, event.y)
         self.x_offset += world_x_before - world_x_after
         self.y_offset += world_y_before - world_y_after
         self.redraw()
+        if self._offset_ratio_update:
+            self._offset_ratio_update(self.get_x_offset_ratio())
 
     def canvas_to_world(self, canvas_x, canvas_y):
         return (self.x_offset + canvas_x / self.zoom_level, self.y_offset + canvas_y / self.zoom_level)
+
+    def get_x_offset_ratio(self):
+        if not self.pil_image:
+            return 0.0
+        canvas_w = self.winfo_width()
+        img_w = self.pil_image.size[0]
+        max_x_off = max(0.0, img_w - canvas_w / self.zoom_level)
+        return self.x_offset / max_x_off if max_x_off > 1e-9 else 0.0
+
+    def set_x_offset_ratio(self, ratio):
+        if not self.pil_image:
+            return
+        canvas_w = self.winfo_width()
+        img_w = self.pil_image.size[0]
+        max_x_off = max(0.0, img_w - canvas_w / self.zoom_level)
+        self.x_offset = ratio * max_x_off
+        self.redraw()
 
 # --- TOOLTIP CLASS ---
 class Tooltip:
