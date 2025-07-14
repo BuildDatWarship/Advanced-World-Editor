@@ -252,13 +252,22 @@ def earthlike(
     blend_km=250.0,
     oversample=1.5,
     target_cdf=None,
+    apply_cdf_remap=True,
+    apply_blend=True,
+    apply_spectral_shape=False,
     taper_knee_px=4,
     micro_relief_amp=0.06,
     sea_level=SEA_LEVEL,
     seed=0,
     elevation_range_m=19848.0,
 ):
-    """Return a smoothed, Earth-like heightmap in the range [0,1]."""
+    """Return a smoothed, Earth-like heightmap in the range [0,1].
+
+    Set ``apply_cdf_remap`` to ``False`` to skip the Earth-like cumulative
+    distribution remapping step. ``apply_blend`` and ``apply_spectral_shape``
+    control whether the distance-weighted Gaussian blend and subsequent
+    spectral shaping are applied.
+    """
 
     # ------------------------------------------------------------------ 1 — Optional up-sampling
     h, w = height.shape
@@ -270,33 +279,39 @@ def earthlike(
         hi_height = height
         hi_mask = plate_mask.astype(np.float32)
 
-    if target_cdf is None:
+    if apply_cdf_remap and target_cdf is None:
         target_cdf = _build_earthlike_cdf(sea_level=sea_level, elevation_range_m=elevation_range_m)
 
     # ------------------------------------------------------------------ 2 — Distance-weighted Gaussian blend from plate centres
-    dist_px = distance_transform_edt(1.0 - hi_mask)
     km_per_px = world_diameter_km / (w * oversample) if w else 1.0
-    mid, spread = blend_km * 0.5, max(1.0, blend_km / 10.0)
-    w_blend = 1.0 / (1.0 + np.exp(-(dist_px * km_per_px - mid) / spread))
-    h_edge = gaussian_filter(hi_height, sigma_edge / km_per_px)
-    h_core = gaussian_filter(hi_height, sigma_core / km_per_px)
-    blurred = (1.0 - w_blend) * h_edge + w_blend * h_core
+    if apply_blend:
+        dist_px = distance_transform_edt(1.0 - hi_mask)
+        mid, spread = blend_km * 0.5, max(1.0, blend_km / 10.0)
+        w_blend = 1.0 / (1.0 + np.exp(-(dist_px * km_per_px - mid) / spread))
+        h_edge = gaussian_filter(hi_height, sigma_edge / km_per_px)
+        h_core = gaussian_filter(hi_height, sigma_core / km_per_px)
+        blurred = (1.0 - w_blend) * h_edge + w_blend * h_core
+    else:
+        blurred = hi_height
 
     # ------------------------------------------------------------------ 3 — Spectral shaping with soft radial taper
-    H2, W2 = blurred.shape
-    kx = np.fft.fftfreq(W2)[None, :]
-    ky = np.fft.fftfreq(H2)[:, None]
-    k = np.sqrt(kx ** 2 + ky ** 2) + 1e-9
-    spec = np.fft.fftshift(fft2(blurred))
-    spec *= k ** (spectral_slope / 2.0) * radial_taper((H2, W2), knee_px=taper_knee_px)
-    shaped = np.fft.ifft2(np.fft.ifftshift(spec)).real
+    if apply_spectral_shape:
+        H2, W2 = blurred.shape
+        kx = np.fft.fftfreq(W2)[None, :]
+        ky = np.fft.fftfreq(H2)[:, None]
+        k = np.sqrt(kx ** 2 + ky ** 2) + 1e-9
+        spec = np.fft.fftshift(fft2(blurred))
+        spec *= k ** (spectral_slope / 2.0) * radial_taper((H2, W2), knee_px=taper_knee_px)
+        shaped = np.fft.ifft2(np.fft.ifftshift(spec)).real
+    else:
+        shaped = blurred
 
     # ------------------------------------------------------------------ 4 — Down-sample to the requested resolution
     if oversample > 1.01:
         shaped = cv2.resize(shaped, (w, h), interpolation=cv2.INTER_AREA)
 
-    # ------------------------------------------------------------------ 5 — Remap to the Earth-like cumulative distribution
-    if target_cdf is not None:
+    # ------------------------------------------------------------------ 5 — Remap to the Earth-like cumulative distribution␊
+    if apply_cdf_remap and target_cdf is not None:
         flat = shaped.ravel()
         ranks = np.argsort(np.argsort(flat))
         cdf_pos = ranks / float(flat.size - 1)
@@ -672,6 +687,8 @@ def generate_world_data(params, scaling_manager):
             params.get("hypsometric_strength", 1.0),
             sea_level=params.get("sea_level", SEA_LEVEL),
             elevation_range_m=params.get("elevation_range_m", 19848),
+            apply_blend=True,
+            apply_spectral_shape=False,
         )
         diagnostic_maps["6b_earthlike_heightmap"] = final_map.copy()
 
