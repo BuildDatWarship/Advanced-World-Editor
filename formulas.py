@@ -19,7 +19,12 @@
 # All parameters from the UI are also available (e.g., uplift_magnitude, lapse_rate_c_per_1000m, etc.)
 
 DEFAULT_FORMULAS = {
-    "heightmap_formula": "(cm + (tsm * uplift_magnitude) + (rm * tsm * ridge_strength) + (bn * tsm * boundary_jaggedness))+ (sc*0.65)",
+    # 'sc' was not defined anywhere which caused `generate_world_data` to fail
+    # when evaluating the heightmap formula.  The result of the expression would
+    # be `None`, leading to errors like `'NoneType' object has no attribute 'copy'`
+    # when the value is copied for diagnostics.  The stray term has been removed
+    # so the formula only relies on the defined inputs.
+    "heightmap_formula": "(cm + (tsm * uplift_magnitude) + (rm * tsm * ridge_strength) + (bn * tsm * boundary_jaggedness))",
 
     "temperature_base_k_formula": "((1 - albedo_mean) * solar_intensity * (1/pi) / stefan_boltzmann)**0.25",
     
