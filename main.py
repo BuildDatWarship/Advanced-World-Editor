@@ -1378,9 +1378,10 @@ class MapGeneratorApp:
         self.stats_tree.insert("", "end", text="Land Cover", values=(f"{land_pct:.1f} %",))
         self.stats_tree.insert("", "end", text="Ocean Cover", values=(f"{100-land_pct:.1f} %",))
 
-        diag = self.last_gen_data.get("diagnostic_maps", {})
-        if "stats_frac_over_2km" in diag:
-            high_pct = diag["stats_frac_over_2km"] * 100
+        if "heightmap" in self.last_gen_data:
+            sea_level_norm = self.vars["sea_level"].get()
+            threshold = sea_level_norm + self.scaling_manager.to_normalized(2000.0, above_sea=True)
+            high_pct = np.mean(self.last_gen_data["heightmap"] > threshold) * 100
             self.stats_tree.insert("", "end", text=">2 km Elevation", values=(f"{high_pct:.2f} %",))
 
         avg_temp_k = np.mean(temp_map)
