@@ -184,6 +184,101 @@ def dynamic_sea_level(raw, ocean_fraction=SEA_LEVEL):
     return np.percentile(raw, 100.0 * ocean_fraction)
 
 
+def advanced_cdf_split(hmap, sea_level, elevation_range_m):
+    """Split heightmap into land and ocean and remap using Earth-like curves.
+
+    The ocean portion is scaled so that 1 corresponds to the water surface and
+    0 to the deepest abyss.  The lowest 0.5% of ocean values are further
+    compressed into the range ``[0, 0.1]`` while the remaining ocean values are
+    mapped to ``[0.1, 1]``.  Land values are scaled relative to sea level and
+    shifted into ``[0.005, 1]``.
+    """
+
+    dyn_level = dynamic_sea_level(hmap, ocean_fraction=sea_level)
+    land_mask = hmap > dyn_level
+    ocean_mask = ~land_mask
+
+    land_vals = hmap[land_mask]
+    ocean_vals = hmap[ocean_mask]
+
+    land_map = np.zeros_like(hmap, dtype=np.float32)
+    ocean_map = np.ones_like(hmap, dtype=np.float32)
+
+    if land_vals.size:
+        land_rel = land_vals - dyn_level
+        max_land = float(land_rel.max()) if land_rel.max() > 0 else 1.0
+        land_norm = land_rel / max_land
+
+        low_cut = np.percentile(land_norm, 7.0)
+        low_mask_local = land_norm <= low_cut
+        rest_mask_local = ~low_mask_local
+
+        land_scaled = np.zeros_like(land_norm, dtype=np.float32)
+
+        if low_mask_local.any():
+            vals = land_norm[low_mask_local]
+            rng = float(vals.max() - vals.min())
+            if rng > 0:
+                land_scaled[low_mask_local] = ((vals - vals.min()) / rng) * 0.0995 + 0.005
+            else:
+                land_scaled[low_mask_local] = 0.005
+
+        if rest_mask_local.any():
+            vals = land_norm[rest_mask_local]
+            rng = float(vals.max() - vals.min())
+            if rng > 0:
+                land_scaled[rest_mask_local] = ((vals - vals.min()) / rng) * 0.9 + 0.1
+            else:
+                land_scaled[rest_mask_local] = 1.0
+        land_map[land_mask] = land_scaled.astype(np.float32)
+
+    if ocean_vals.size:
+        depth = dyn_level - ocean_vals
+        max_depth = float(depth.max()) if depth.max() > 0 else 1.0
+        depth_norm = depth / max_depth
+        surface_rel = 1.0 - depth_norm
+
+        abyss_cut = np.percentile(depth_norm, 99.5)
+        abyss_mask = depth_norm >= abyss_cut
+
+        if abyss_mask.any():
+            abyss_vals = surface_rel[abyss_mask]
+            rng = float(abyss_vals.max() - abyss_vals.min())
+            if rng > 0:
+                surface_rel[abyss_mask] = ((abyss_vals - abyss_vals.min()) / rng) * 0.1
+            else:
+                surface_rel[abyss_mask] = 0.0
+
+        floor_mask = ~abyss_mask
+        if floor_mask.any():
+            floor_vals = surface_rel[floor_mask]
+            rng = float(floor_vals.max() - floor_vals.min())
+            if rng > 0:
+                surface_rel[floor_mask] = ((floor_vals - floor_vals.min()) / rng) * 0.9 + 0.1
+            else:
+                surface_rel[floor_mask] = 1.0
+
+        ocean_map[ocean_mask] = surface_rel.astype(np.float32)
+
+    ocean_curve, land_curve = build_earthlike_curves(sea_level, elevation_range_m)
+
+    result = np.zeros_like(hmap, dtype=np.float32)
+
+    if ocean_vals.size:
+        mapped_ocean = partial_remap(ocean_map[ocean_mask].ravel(), ocean_curve)
+        result[ocean_mask] = mapped_ocean.reshape(ocean_map[ocean_mask].shape)
+
+    if land_vals.size:
+        mapped_land = partial_remap(land_map[land_mask].ravel(), land_curve)
+        result[land_mask] = mapped_land.reshape(land_map[land_mask].shape)
+
+    diagnostics = {
+        "earthlike_land_cdf": land_map,
+        "earthlike_ocean_cdf": ocean_map,
+    }
+    return result, land_mask, diagnostics
+
+
 def _build_earthlike_cdf(sea_level=SEA_LEVEL, elevation_range_m=19848.0):
     """Create a single Earth-like CDF for hypsometric remapping."""
     ocean, land = build_earthlike_curves(sea_level, elevation_range_m)
@@ -210,35 +305,6 @@ def partial_remap(values, target, adherence=ADHERENCE):
     out = np.empty_like(values, dtype=np.float32)
     out[sorter] = blended
     return out
-
-def earthlike_remap(raw, land_mask, ocean_curve, land_curve, sea_level, max_h_m, seed=0):
-    """Remap elevations separately for ocean and land using target CDFs."""
-    h = raw.copy()
-    ocean = ~land_mask
-    if ocean.any():
-        vals = h[ocean].ravel()
-        mapped = partial_remap(vals, ocean_curve)
-        h[ocean] = mapped.reshape(h[ocean].shape)
-
-
-    land = land_mask
-    if land.any():
-        vals = h[land].ravel()
-        mapped = partial_remap(vals, land_curve)
-        h[land] = mapped.reshape(h[land].shape)
-
-    # small jitter on shallow shelf to avoid flat bands
-    if OpenSimplex is not None:
-        noise = OpenSimplex(seed + 77)
-        base_fn = getattr(noise, "noise2", None) or noise.noise2d
-        shelf = (~land_mask) & (h > meters_to_norm(-200, sea_level, max_h_m))
-        if shelf.any():
-            yi, xi = np.where(shelf)
-            amp = meters_to_norm(6.0, sea_level, max_h_m) - sea_level
-            for y, x in zip(yi, xi):
-                h[y, x] += amp * base_fn(x * 0.01, y * 0.01)
-
-    return h
 
 # --- Heightmap shaping based on tectonic distance and Earth-like statistics ---
 def earthlike(
@@ -313,45 +379,15 @@ def earthlike(
     # ------------------------------------------------------------------ 5 — Remap to the Earth-like cumulative distribution␊
     diagnostics = {}
     if apply_cdf_remap and target_cdf is not None:
-        # Determine dynamic sea level so that the ocean fraction matches
-        dyn_level = dynamic_sea_level(shaped, ocean_fraction=sea_level)
-        land_mask_dyn = shaped > dyn_level
-
-        ocean_curve, land_curve = build_earthlike_curves(sea_level, elevation_range_m)
-
-        land_vals = shaped[land_mask_dyn].ravel()
-        ocean_vals = shaped[~land_mask_dyn].ravel()
-
-        if land_vals.size:
-            mapped_land = partial_remap(land_vals, land_curve)
-        else:
-            mapped_land = np.array([], dtype=np.float32)
-        if ocean_vals.size:
-            mapped_ocean = partial_remap(ocean_vals, ocean_curve)
-        else:
-            mapped_ocean = np.array([], dtype=np.float32)
-
-        land_map = np.zeros_like(shaped, dtype=np.float32)
-        ocean_map = np.zeros_like(shaped, dtype=np.float32)
-
-        if land_vals.size:
-            land_map[land_mask_dyn] = mapped_land.reshape(land_map[land_mask_dyn].shape)
-        if ocean_vals.size:
-            ocean_map[~land_mask_dyn] = mapped_ocean.reshape(ocean_map[~land_mask_dyn].shape)
-
-        shaped = np.where(
-            land_mask_dyn,
-            sea_level + land_map * (1.0 - sea_level),
-            sea_level - ocean_map * sea_level,
-        )
-
-        diagnostics["earthlike_land_cdf"] = land_map.copy()
-        diagnostics["earthlike_ocean_cdf"] = ocean_map.copy()
+        shaped, land_mask, diag_maps = advanced_cdf_split(shaped, sea_level, elevation_range_m)
+        diagnostics.update(diag_maps)
+    else:
+        land_mask = shaped > sea_level
 
     # ------------------------------------------------------------------ 6 — Decide what is land after the remap
-    land_mask = shaped > sea_level
+    # land_mask already determined above
 
-    # ------------------------------------------------------------------ 7 — Add back high-pass + micro-noise only on land
+    # -----
     lp_sigma_km = 90.0
     sigma_lp_px = max(1.0, (lp_sigma_km / world_diameter_km) * w)
     lowpass = gaussian_filter(shaped, sigma_lp_px)
@@ -388,6 +424,8 @@ def earthlike(
     shaped = 0.5 + cdf_factor * (shaped - 0.5)
     lo, hi = np.percentile(shaped, (0.05, 99.95))
     shaped = (shaped - lo) / (hi - lo + 1e-9)
+    delta = sea_level - np.percentile(shaped, 100.0 * sea_level)
+    shaped += delta
     return np.clip(shaped, 0.0, 1.0), diagnostics
 
 # --- Generation Algorithms ---
@@ -831,23 +869,6 @@ def calculate_albedo_map(biome_indices_map, biomes, hmap, sea_level):
     albedo_value = ocean_fraction * 0.06 + land_fraction * 0.4
     return np.full_like(hmap, albedo_value, dtype=np.float32)
 
-    biome_albedos = {}
-    for i, b in enumerate(biomes):
-        if "SNOW" in b['name'] or "ICE" in b['name']:
-            biome_albedos[i] = 0.8
-        elif "DESERT" in b['name']:
-            biome_albedos[i] = 0.4
-        elif "FOREST" in b['name']:
-             biome_albedos[i] = 0.15
-        elif not b.get('is_water'): # generic non-water
-            rgb = hex_to_rgb(b['color'])
-            biome_albedos[i] = (0.254 * rgb[0] + 0.408 * rgb[1] + 0.338 * rgb[2]) / 255.0
-
-    for idx, albedo in biome_albedos.items():
-        albedo_map[biome_indices_map == idx] = albedo
-    
-    return albedo_map
-
 def generate_temperature_map(hmap, albedo_map, params, scaling_manager):
     # --- Formula Evaluation for Temperature ---
     aeval = AstevalInterpreter(use_numpy=True)
@@ -952,6 +973,13 @@ def apply_geostrophic_wind_advection(temp_map_kelvin, params):
     }
 
     return {"temperature_map": advected_temp, "diagnostics": diagnostics}
+
+def apply_temperature_correction(temp_map_kelvin, params, target_c=15.0):
+    """Adjust global temperatures so the mean equals ``target_c``."""
+    current_avg_c = np.mean(temp_map_kelvin - KELVIN_TO_CELSIUS_OFFSET)
+    delta = target_c - current_avg_c
+    corrected = temp_map_kelvin + delta
+    return {"temperature_map": corrected, "diagnostics": {"temp_correction": delta}}
 
 # --- Replace generate_rainfall_map with the corrected version ---
 def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_map, params, scaling_manager):

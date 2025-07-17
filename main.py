@@ -1133,15 +1133,20 @@ class MapGeneratorApp:
             # Step 3.5: Apply Final Temperature Blur (After Advection)
             final_blur_sigma = params.get('final_temp_blur_sigma', 0)
             if final_blur_sigma > 0 and self.last_gen_data.get('temperature_map') is not None:
-                 self.status_var.set("Simulating climate (3.5/5): Applying Final Temperature Blur..."); self.root.update_idletasks()
-                 try:
-                      # Apply Gaussian blur directly to the main temperature map
-                      self.last_gen_data['temperature_map'] = gaussian_filter(self.last_gen_data['temperature_map'], sigma=final_blur_sigma, mode='wrap')
-                      # Optionally add the blurred map as a diagnostic layer
-                      self.last_gen_data.setdefault("diagnostic_maps", {})["climate_temp_final_blurred"] = self.last_gen_data['temperature_map'].copy()
-                 except Exception as e:
-                      print(f"Error applying final temperature blur: {e}")
-                      # Continue without blur if it fails
+                self.status_var.set("Simulating climate (3.5/5): Applying Final Temperature Blur..."); self.root.update_idletasks()
+                try:
+                    # Apply Gaussian blur directly to the main temperature map
+                    self.last_gen_data['temperature_map'] = gaussian_filter(self.last_gen_data['temperature_map'], sigma=final_blur_sigma, mode='wrap')
+                    # Optionally add the blurred map as a diagnostic layer
+                    self.last_gen_data.setdefault("diagnostic_maps", {})["climate_temp_final_blurred"] = self.last_gen_data['temperature_map'].copy()
+                except Exception as e:
+                    print(f"Error applying final temperature blur: {e}")
+                    # Continue without blur if it fails
+
+            # Step 3.6: Global temperature correction
+            corr_data = gen.apply_temperature_correction(self.last_gen_data['temperature_map'], params)
+            self.last_gen_data['temperature_map'] = corr_data['temperature_map']
+            self.last_gen_data.setdefault("diagnostic_maps", {}).update(corr_data.get('diagnostics', {}))
 
             # Recalculate river deposition with temperature constraints
             self.status_var.set("Simulating climate (3.7/5): Updating Rivers..."); self.root.update_idletasks()
