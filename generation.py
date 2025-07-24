@@ -188,7 +188,7 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
     """Split heightmap into land and ocean and remap using Earth-like curves.
 
     The ocean portion is scaled so that 1 corresponds to the water surface and
-    0 to the deepest abyss.  The lowest 0.5% of ocean values are further
+    0 to the deepest abyss.  The lowest 2% of ocean values are further
     compressed into the range ``[0, 0.1]`` while the remaining ocean values are
     mapped to ``[0.1, 1]``.  Land values are scaled relative to sea level and
     shifted into ``[0.005, 1]``.
@@ -277,7 +277,7 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
         surface_rel = 1.0 - depth_norm
         diag_presplit_ocean[ocean_mask] = depth_norm
 
-        abyss_cut = np.percentile(depth_norm, 99.5)
+        abyss_cut = np.percentile(depth_norm, 98.0)
         abyss_mask = depth_norm >= abyss_cut
 
         if abyss_mask.any():
@@ -318,6 +318,20 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
     if land_vals.size:
         mapped_land = partial_remap(land_map[land_mask].ravel(), land_curve)
         result[land_mask] = mapped_land.reshape(land_map[land_mask].shape)
+
+    # Smooth land and ocean separately to remove jitter without blending
+    if land_vals.size:
+        lm = land_mask.astype(np.float32)
+        sm = gaussian_filter(result * lm, sigma=0.3)
+        norm = gaussian_filter(lm, sigma=0.3)
+        result[land_mask] = np.divide(sm, norm, out=np.zeros_like(sm), where=norm>0)[land_mask]
+    if ocean_vals.size:
+        om = ocean_mask.astype(np.float32)
+        sm = gaussian_filter(result * om, sigma=0.3)
+        norm = gaussian_filter(om, sigma=0.3)
+        result[ocean_mask] = np.divide(sm, norm, out=np.zeros_like(sm), where=norm>0)[ocean_mask]
+
+    result = np.clip(result, 0.0, 1.0)
 
     diagnostics = {
         "earthlike_land_cdf": land_map,
