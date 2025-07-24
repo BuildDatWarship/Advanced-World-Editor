@@ -203,40 +203,79 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
 
     land_map = np.zeros_like(hmap, dtype=np.float32)
     ocean_map = np.ones_like(hmap, dtype=np.float32)
+    diag_presplit_land = np.zeros_like(hmap, dtype=np.float32)
+    diag_presplit_ocean = np.zeros_like(hmap, dtype=np.float32)
+    land_low_scaled = np.zeros_like(hmap, dtype=np.float32)
+    land_rest_scaled = np.zeros_like(hmap, dtype=np.float32)
+    land_peaks_scaled = np.zeros_like(hmap, dtype=np.float32)
+    ocean_abyss_scaled = np.zeros_like(hmap, dtype=np.float32)
+    ocean_floor_scaled = np.zeros_like(hmap, dtype=np.float32)
 
     if land_vals.size:
         land_rel = land_vals - dyn_level
         max_land = float(land_rel.max()) if land_rel.max() > 0 else 1.0
         land_norm = land_rel / max_land
 
+        diag_presplit_land[land_mask] = land_norm
+
         low_cut = np.percentile(land_norm, 7.0)
+        peak_cut = np.percentile(land_norm, 97.0)
         low_mask_local = land_norm <= low_cut
-        rest_mask_local = ~low_mask_local
+        peak_mask_local = land_norm >= peak_cut
+        rest_mask_local = ~(low_mask_local | peak_mask_local)
 
         land_scaled = np.zeros_like(land_norm, dtype=np.float32)
+        local_low = np.zeros_like(land_norm, dtype=np.float32)
+        local_rest = np.zeros_like(land_norm, dtype=np.float32)
+        local_peaks = np.zeros_like(land_norm, dtype=np.float32)
 
         if low_mask_local.any():
             vals = land_norm[low_mask_local]
             rng = float(vals.max() - vals.min())
             if rng > 0:
-                land_scaled[low_mask_local] = ((vals - vals.min()) / rng) * 0.0995 + 0.005
+                scaled = ((vals - vals.min()) / rng) * 0.0995 + 0.005
             else:
-                land_scaled[low_mask_local] = 0.005
+                scaled = np.full_like(vals, 0.005)
+            land_scaled[low_mask_local] = scaled
+            tmp = np.zeros_like(land_norm)
+            tmp[low_mask_local] = scaled
+            local_low = tmp
 
         if rest_mask_local.any():
             vals = land_norm[rest_mask_local]
             rng = float(vals.max() - vals.min())
             if rng > 0:
-                land_scaled[rest_mask_local] = ((vals - vals.min()) / rng) * 0.9 + 0.1
+                scaled = ((vals - vals.min()) / rng) * 0.87 + 0.1
             else:
-                land_scaled[rest_mask_local] = 1.0
+                scaled = np.full_like(vals, 0.1)
+            land_scaled[rest_mask_local] = scaled
+            tmp = np.zeros_like(land_norm)
+            tmp[rest_mask_local] = scaled
+            local_rest = tmp
+
+        if peak_mask_local.any():
+            vals = land_norm[peak_mask_local]
+            rng = float(vals.max() - vals.min())
+            if rng > 0:
+                scaled = ((vals - vals.min()) / rng) * 0.03 + 0.97
+            else:
+                scaled = np.full_like(vals, 1.0)
+            land_scaled[peak_mask_local] = scaled
+            tmp = np.zeros_like(land_norm)
+            tmp[peak_mask_local] = scaled
+            local_peaks = tmp
+
         land_map[land_mask] = land_scaled.astype(np.float32)
+        land_low_scaled[land_mask] = local_low
+        land_rest_scaled[land_mask] = local_rest
+        land_peaks_scaled[land_mask] = local_peaks
 
     if ocean_vals.size:
         depth = dyn_level - ocean_vals
         max_depth = float(depth.max()) if depth.max() > 0 else 1.0
         depth_norm = depth / max_depth
         surface_rel = 1.0 - depth_norm
+        diag_presplit_ocean[ocean_mask] = depth_norm
 
         abyss_cut = np.percentile(depth_norm, 99.5)
         abyss_mask = depth_norm >= abyss_cut
@@ -245,18 +284,26 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
             abyss_vals = surface_rel[abyss_mask]
             rng = float(abyss_vals.max() - abyss_vals.min())
             if rng > 0:
-                surface_rel[abyss_mask] = ((abyss_vals - abyss_vals.min()) / rng) * 0.1
+                scaled = ((abyss_vals - abyss_vals.min()) / rng) * 0.1
             else:
-                surface_rel[abyss_mask] = 0.0
+                scaled = np.zeros_like(abyss_vals)
+            surface_rel[abyss_mask] = scaled
+            tmp = np.zeros_like(depth_norm)
+            tmp[abyss_mask] = scaled
+            ocean_abyss_scaled[ocean_mask] = tmp
 
         floor_mask = ~abyss_mask
         if floor_mask.any():
             floor_vals = surface_rel[floor_mask]
             rng = float(floor_vals.max() - floor_vals.min())
             if rng > 0:
-                surface_rel[floor_mask] = ((floor_vals - floor_vals.min()) / rng) * 0.9 + 0.1
+                scaled = ((floor_vals - floor_vals.min()) / rng) * 0.9 + 0.1
             else:
-                surface_rel[floor_mask] = 1.0
+                scaled = np.ones_like(floor_vals)
+            surface_rel[floor_mask] = scaled
+            tmp = np.zeros_like(depth_norm)
+            tmp[floor_mask] = scaled
+            ocean_floor_scaled[ocean_mask] = tmp
 
         ocean_map[ocean_mask] = surface_rel.astype(np.float32)
 
@@ -275,6 +322,13 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
     diagnostics = {
         "earthlike_land_cdf": land_map,
         "earthlike_ocean_cdf": ocean_map,
+        "land_presplit": diag_presplit_land,
+        "ocean_presplit": diag_presplit_ocean,
+        "land_low_scaled": land_low_scaled,
+        "land_rest_scaled": land_rest_scaled,
+        "land_peaks_scaled": land_peaks_scaled,
+        "ocean_abyss_scaled": ocean_abyss_scaled if ocean_vals.size else np.zeros_like(hmap, dtype=np.float32),
+        "ocean_floor_scaled": ocean_floor_scaled if ocean_vals.size else np.zeros_like(hmap, dtype=np.float32),
     }
     return result, land_mask, diagnostics
 
@@ -376,13 +430,9 @@ def earthlike(
     if oversample > 1.01:
         shaped = cv2.resize(shaped, (w, h), interpolation=cv2.INTER_AREA)
 
-    # ------------------------------------------------------------------ 5 — Remap to the Earth-like cumulative distribution␊
+    # ------------------------------------------------------------------ 5 — Placeholder for CDF remap later
     diagnostics = {}
-    if apply_cdf_remap and target_cdf is not None:
-        shaped, land_mask, diag_maps = advanced_cdf_split(shaped, sea_level, elevation_range_m)
-        diagnostics.update(diag_maps)
-    else:
-        land_mask = shaped > sea_level
+    land_mask = shaped > sea_level
 
     # ------------------------------------------------------------------ 6 — Decide what is land after the remap
     # land_mask already determined above
@@ -419,6 +469,13 @@ def earthlike(
     spec = fft2(shaped)
     spec *= radial_taper(shaped.shape, knee_px=taper_knee_px)
     shaped = np.real(ifft2(spec))
+
+    # ----------------------------------------------------------------- 9b — Apply CDF remapping after Nyquist roll-off
+    if apply_cdf_remap and target_cdf is not None:
+        shaped, land_mask, diag_maps = advanced_cdf_split(shaped, sea_level, elevation_range_m)
+        diagnostics.update(diag_maps)
+    else:
+        land_mask = shaped > sea_level
 
     # ----------------------------------------------------------------- 10 — Return normalised, clipped result
     shaped = 0.5 + cdf_factor * (shaped - 0.5)
@@ -979,7 +1036,9 @@ def apply_temperature_correction(temp_map_kelvin, params, target_c=15.0):
     current_avg_c = np.mean(temp_map_kelvin - KELVIN_TO_CELSIUS_OFFSET)
     delta = target_c - current_avg_c
     corrected = temp_map_kelvin + delta
-    return {"temperature_map": corrected, "diagnostics": {"temp_correction": delta}}
+    # Provide a diagnostic map so the UI can visualise the correction amount
+    delta_map = np.full_like(temp_map_kelvin, delta, dtype=np.float32)
+    return {"temperature_map": corrected, "diagnostics": {"temp_correction": delta_map}}
 
 # --- Replace generate_rainfall_map with the corrected version ---
 def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_map, params, scaling_manager):
