@@ -204,9 +204,6 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
     land_mask = hmap > dyn_level
     ocean_mask = ~land_mask
 
-    land_vals = hmap[land_mask]
-    ocean_vals = hmap[ocean_mask]
-
     land_map = np.zeros_like(hmap, dtype=np.float32)
     ocean_map = np.ones_like(hmap, dtype=np.float32)
     diag_presplit_land = np.zeros_like(hmap, dtype=np.float32)
@@ -217,13 +214,39 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
     land_peaks_scaled = np.zeros_like(hmap, dtype=np.float32)
     ocean_abyss_scaled = np.zeros_like(hmap, dtype=np.float32)
     ocean_floor_scaled = np.zeros_like(hmap, dtype=np.float32)
+    coastline = np.zeros_like(hmap, dtype=np.float32)
+
+    ocean_vals = hmap[ocean_mask]
+    ocean_curve, land_curve = build_earthlike_curves(sea_level, elevation_range_m)
+
+    result = np.zeros_like(hmap, dtype=np.float32)
+
+    if ocean_vals.size:
+        mapped_ocean_vals = partial_remap(ocean_map[ocean_mask].ravel(), ocean_curve)
+        mapped_ocean = np.zeros_like(hmap, dtype=np.float32)
+        mapped_ocean[ocean_mask] = mapped_ocean_vals.reshape(ocean_map[ocean_mask].shape)
+        coast_mask = mapped_ocean == 1.0
+        coastline[coast_mask] = 0.01
+        result[ocean_mask & ~coast_mask] = mapped_ocean[ocean_mask & ~coast_mask]
+    else:
+        coast_mask = np.zeros_like(hmap, dtype=bool)
+
+    land_mask = land_mask | coast_mask
+    ocean_mask = ~land_mask
+    ocean_vals = hmap[ocean_mask]
+
+    land_vals = hmap[land_mask]
 
     if land_vals.size:
         land_rel = land_vals - dyn_level
         max_land = float(land_rel.max()) if land_rel.max() > 0 else 1.0
-        land_norm = land_rel / max_land
-
-        diag_presplit_land[land_mask] = land_norm
+        base_norm = land_rel / max_land
+        diag_presplit_land[land_mask] = base_norm
+        diag_presplit_land[coast_mask] = 0.01
+        max_v = diag_presplit_land[land_mask | coast_mask].max()
+        if max_v > 0:
+            diag_presplit_land[land_mask | coast_mask] /= max_v
+        land_norm = diag_presplit_land[land_mask]
 
         low_cut = np.percentile(land_norm, 7.0)
         median_cut = np.percentile(land_norm, 50.0)
@@ -293,50 +316,7 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
         land_upper_scaled[land_mask] = local_upper
         land_peaks_scaled[land_mask] = local_peaks
 
-    if ocean_vals.size:
-        depth = dyn_level - ocean_vals
-        max_depth = float(depth.max()) if depth.max() > 0 else 1.0
-        depth_norm = depth / max_depth
-        surface_rel = 1.0 - depth_norm
-        diag_presplit_ocean[ocean_mask] = depth_norm
-
-        abyss_cut = np.percentile(depth_norm, 98.0)
-        abyss_mask = depth_norm >= abyss_cut
-
-        if abyss_mask.any():
-            abyss_vals = surface_rel[abyss_mask]
-            rng = float(abyss_vals.max() - abyss_vals.min())
-            if rng > 0:
-                scaled = ((abyss_vals - abyss_vals.min()) / rng) * 0.1
-            else:
-                scaled = np.zeros_like(abyss_vals)
-            surface_rel[abyss_mask] = scaled
-            tmp = np.zeros_like(depth_norm)
-            tmp[abyss_mask] = scaled
-            ocean_abyss_scaled[ocean_mask] = tmp
-
-        floor_mask = ~abyss_mask
-        if floor_mask.any():
-            floor_vals = surface_rel[floor_mask]
-            rng = float(floor_vals.max() - floor_vals.min())
-            if rng > 0:
-                scaled = ((floor_vals - floor_vals.min()) / rng) * 0.9 + 0.1
-            else:
-                scaled = np.ones_like(floor_vals)
-            surface_rel[floor_mask] = scaled
-            tmp = np.zeros_like(depth_norm)
-            tmp[floor_mask] = scaled
-            ocean_floor_scaled[ocean_mask] = tmp
-
-        ocean_map[ocean_mask] = surface_rel.astype(np.float32)
-
     ocean_curve, land_curve = build_earthlike_curves(sea_level, elevation_range_m)
-
-    result = np.zeros_like(hmap, dtype=np.float32)
-
-    if ocean_vals.size:
-        mapped_ocean = partial_remap(ocean_map[ocean_mask].ravel(), ocean_curve)
-        result[ocean_mask] = mapped_ocean.reshape(ocean_map[ocean_mask].shape)
 
     if land_vals.size:
         mapped_land = partial_remap(land_map[land_mask].ravel(), land_curve)
@@ -555,8 +535,18 @@ def generate_flow_field_landmass(w, h, scale, ws, octaves, seed):
     arr = vec_pnoise2((xv + flow_x) / scale, (yv + flow_y) / scale, octaves=octaves, base=seed)
     return normalize_map(arr)
 
-def generate_ridged_multifractal_noise(w, h, scale, octaves, seed, warp_scale=None, warp_amp=0.0):
-    """Ridged multifractal noise with optional domain warping."""
+def generate_ridged_multifractal_noise(
+    w,
+    h,
+    scale,
+    octaves,
+    seed,
+    freq_map=None,
+    warp_scale=None,
+    warp_amp=0.0,
+    min_freq_mult=0.01,
+):
+    """Ridged multifractal noise with optional domain warping and per-pixel frequency."""
 
     x, y = np.arange(w), np.arange(h)
     xv, yv = np.meshgrid(x, y)
@@ -567,7 +557,15 @@ def generate_ridged_multifractal_noise(w, h, scale, octaves, seed, warp_scale=No
         xv = xv + warp_amp * w * warp_noise(xv * wf, yv * wf)
         yv = yv + warp_amp * h * warp_noise((xv + 11.3) * wf, (yv - 7.9) * wf)
 
-    raw_noise = vec_pnoise2(xv / scale, yv / scale, octaves=octaves, base=seed)
+    xv_scaled = xv / scale
+    yv_scaled = yv / scale
+
+    if freq_map is not None:
+        freq_mult = np.clip(freq_map, min_freq_mult, None)
+        xv_scaled = xv_scaled * freq_mult
+        yv_scaled = yv_scaled * freq_mult
+
+    raw_noise = vec_pnoise2(xv_scaled, yv_scaled, octaves=octaves, base=seed)
     arr = (1.0 - np.abs(raw_noise)) ** 2
     return normalize_map(arr)
 
@@ -852,7 +850,15 @@ def generate_world_data(params, scaling_manager):
         diagnostic_maps["3_continent_base"] = cm.copy()
         # Use ridged multifractal noise with 40× the frequency of the continent base
         ridge_scale = max(params["continent_scale"] / 40.0, 1e-3)
-        rm = generate_ridged_multifractal_noise(w, h, ridge_scale, params["ridge_octaves"], ms + 4)
+        freq_mult_map = np.clip(cm ** 2, 0.01, 1.0)
+        rm = generate_ridged_multifractal_noise(
+            w,
+            h,
+            ridge_scale,
+            params["ridge_octaves"],
+            ms + 4,
+            freq_map=freq_mult_map,
+        )
         diagnostic_maps["4_mountain_ridges"] = rm.copy()
         bn = generate_perlin_noise(w, h, params["boundary_detail_scale"], 8, ms + 2)
         diagnostic_maps["5_boundary_noise"] = bn.copy()
@@ -1130,7 +1136,7 @@ def generate_rainfall_map(hmap, temp_map_kelvin, flow_angles, river_deposition_m
 
 
     # 1. Calculate Sea Blur using an exponential kernel
-    sea_blur_radius_km = 500.0
+    sea_blur_radius_km = 1000.0
     sea_radius_px = (sea_blur_radius_km / world_diameter_km) * w if world_diameter_km > 1e-9 and w > 0 else 1.0
     sea_radius_px = max(1.0, sea_radius_px) * sigma_factor
     sea_kernel = exp_kernel(int(sea_radius_px), sea_radius_px)
