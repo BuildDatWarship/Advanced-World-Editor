@@ -191,7 +191,13 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
     0 to the deepest abyss.  The lowest 2% of ocean values are further
     compressed into the range ``[0, 0.1]`` while the remaining ocean values are
     mapped to ``[0.1, 1]``.  Land values are scaled relative to sea level and
-    shifted into ``[0.005, 1]``.
+    split into four ranges:
+
+    - ``land_low``: bottom 7% → ``[0.005, 0.0995]``
+    - ``land_median``: next portion up to the 50% percentile (excluding low)
+      → ``[0.1, 0.74]``
+    - ``land_upper``: between the 50% and 97% percentiles → ``[0.74, 0.97]``
+    - ``land_peaks``: top 3% → ``[0.97, 1]``
     """
 
     dyn_level = dynamic_sea_level(hmap, ocean_fraction=sea_level)
@@ -206,7 +212,8 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
     diag_presplit_land = np.zeros_like(hmap, dtype=np.float32)
     diag_presplit_ocean = np.zeros_like(hmap, dtype=np.float32)
     land_low_scaled = np.zeros_like(hmap, dtype=np.float32)
-    land_rest_scaled = np.zeros_like(hmap, dtype=np.float32)
+    land_median_scaled = np.zeros_like(hmap, dtype=np.float32)
+    land_upper_scaled = np.zeros_like(hmap, dtype=np.float32)
     land_peaks_scaled = np.zeros_like(hmap, dtype=np.float32)
     ocean_abyss_scaled = np.zeros_like(hmap, dtype=np.float32)
     ocean_floor_scaled = np.zeros_like(hmap, dtype=np.float32)
@@ -219,14 +226,17 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
         diag_presplit_land[land_mask] = land_norm
 
         low_cut = np.percentile(land_norm, 7.0)
+        median_cut = np.percentile(land_norm, 50.0)
         peak_cut = np.percentile(land_norm, 97.0)
         low_mask_local = land_norm <= low_cut
         peak_mask_local = land_norm >= peak_cut
-        rest_mask_local = ~(low_mask_local | peak_mask_local)
+        median_mask_local = (land_norm <= median_cut) & ~low_mask_local
+        upper_mask_local = ~(low_mask_local | median_mask_local | peak_mask_local)
 
         land_scaled = np.zeros_like(land_norm, dtype=np.float32)
         local_low = np.zeros_like(land_norm, dtype=np.float32)
-        local_rest = np.zeros_like(land_norm, dtype=np.float32)
+        local_median = np.zeros_like(land_norm, dtype=np.float32)
+        local_upper = np.zeros_like(land_norm, dtype=np.float32)
         local_peaks = np.zeros_like(land_norm, dtype=np.float32)
 
         if low_mask_local.any():
@@ -241,17 +251,29 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
             tmp[low_mask_local] = scaled
             local_low = tmp
 
-        if rest_mask_local.any():
-            vals = land_norm[rest_mask_local]
+        if median_mask_local.any():
+            vals = land_norm[median_mask_local]
             rng = float(vals.max() - vals.min())
             if rng > 0:
-                scaled = ((vals - vals.min()) / rng) * 0.87 + 0.1
+                scaled = ((vals - vals.min()) / rng) * 0.64 + 0.1
             else:
                 scaled = np.full_like(vals, 0.1)
-            land_scaled[rest_mask_local] = scaled
+            land_scaled[median_mask_local] = scaled
             tmp = np.zeros_like(land_norm)
-            tmp[rest_mask_local] = scaled
-            local_rest = tmp
+            tmp[median_mask_local] = scaled
+            local_median = tmp
+
+        if upper_mask_local.any():
+            vals = land_norm[upper_mask_local]
+            rng = float(vals.max() - vals.min())
+            if rng > 0:
+                scaled = ((vals - vals.min()) / rng) * 0.23 + 0.74
+            else:
+                scaled = np.full_like(vals, 0.74)
+            land_scaled[upper_mask_local] = scaled
+            tmp = np.zeros_like(land_norm)
+            tmp[upper_mask_local] = scaled
+            local_upper = tmp
 
         if peak_mask_local.any():
             vals = land_norm[peak_mask_local]
@@ -267,7 +289,8 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
 
         land_map[land_mask] = land_scaled.astype(np.float32)
         land_low_scaled[land_mask] = local_low
-        land_rest_scaled[land_mask] = local_rest
+        land_median_scaled[land_mask] = local_median
+        land_upper_scaled[land_mask] = local_upper
         land_peaks_scaled[land_mask] = local_peaks
 
     if ocean_vals.size:
@@ -340,7 +363,8 @@ def advanced_cdf_split(hmap, sea_level, elevation_range_m):
         "land_presplit": diag_presplit_land,
         "ocean_presplit": diag_presplit_ocean,
         "land_low_scaled": land_low_scaled,
-        "land_rest_scaled": land_rest_scaled,
+        "land_median_scaled": land_median_scaled,
+        "land_upper_scaled": land_upper_scaled,
         "land_peaks_scaled": land_peaks_scaled,
         "ocean_abyss_scaled": ocean_abyss_scaled if ocean_vals.size else np.zeros_like(hmap, dtype=np.float32),
         "ocean_floor_scaled": ocean_floor_scaled if ocean_vals.size else np.zeros_like(hmap, dtype=np.float32),
@@ -531,19 +555,42 @@ def generate_flow_field_landmass(w, h, scale, ws, octaves, seed):
     arr = vec_pnoise2((xv + flow_x) / scale, (yv + flow_y) / scale, octaves=octaves, base=seed)
     return normalize_map(arr)
 
-def generate_ridged_multifractal_noise(w, h, scale, octaves, seed):
+def generate_ridged_multifractal_noise(w, h, scale, octaves, seed, warp_scale=None, warp_amp=0.0):
+    """Ridged multifractal noise with optional domain warping."""
+
     x, y = np.arange(w), np.arange(h)
     xv, yv = np.meshgrid(x, y)
+
+    if warp_scale is not None and warp_amp != 0.0:
+        wf = 1.0 / warp_scale
+        warp_noise = _make_noise2(seed + 99)
+        xv = xv + warp_amp * w * warp_noise(xv * wf, yv * wf)
+        yv = yv + warp_amp * h * warp_noise((xv + 11.3) * wf, (yv - 7.9) * wf)
+
     raw_noise = vec_pnoise2(xv / scale, yv / scale, octaves=octaves, base=seed)
     arr = (1.0 - np.abs(raw_noise)) ** 2
     return normalize_map(arr)
 
 def generate_tectonic_map(w, h, num_plates, seed, lloyd_steps=2):
-    """Voronoi plates grown by successive fission."""
+    """Voronoi plates grown by successive fission.
+
+    Parameters
+    ----------
+    w, h : int
+        Output dimensions.
+    num_plates : int
+        Initial number of major plates. The algorithm will continue fission
+        until a total of 17 plates is produced.
+    seed : int
+        Random seed.
+    lloyd_steps : int, optional
+        Number of Lloyd relaxation steps for plate centres.
+    """
+
     rng = np.random.default_rng(seed)
 
-    # 1. start from seven majors, Poisson-disc to avoid crowding
-    points = rng.random((7, 2)) * [w, h]
+    # 1. start from the requested number of majors, Poisson-disc to avoid crowding
+    points = rng.random((num_plates, 2)) * [w, h]
     min_d2 = (0.18 * min(w, h)) ** 2
     keep = []
     for p in points:
@@ -551,8 +598,10 @@ def generate_tectonic_map(w, h, num_plates, seed, lloyd_steps=2):
             keep.append(p)
     points = np.array(keep)
 
-     # 2. grow to target count by fission (multiple splits per iteration)
-    while len(points) < num_plates:
+    target_plate_count = 17
+
+    # 2. grow to target count by fission (multiple splits per iteration)
+    while len(points) < target_plate_count:
         tree = cKDTree(points)
         yi, xi = np.indices((h, w))
         px = np.stack((xi.ravel(), yi.ravel()), axis=-1)
@@ -563,12 +612,12 @@ def generate_tectonic_map(w, h, num_plates, seed, lloyd_steps=2):
 
         mask = owner == parent
         ys, xs = np.where(mask)
-        splits = min(num_plates - len(points), rng.integers(1, 4))
+        splits = min(target_plate_count - len(points), rng.integers(1, 4))
         for _ in range(splits):
             k = rng.integers(0, len(xs))
             new_pt = np.array([xs[k], ys[k]])
             points = np.vstack([points, new_pt])
-            if len(points) >= num_plates:
+            if len(points) >= target_plate_count:
                 break
 
     # 3. a couple of Lloyd relaxations
@@ -792,6 +841,7 @@ def generate_world_data(params, scaling_manager):
         diagnostic_maps = {}
 
         # --- Generate Base Maps ---
+        # Start from the user-specified major plates but always fissure into 17 total plates
         tsm, pp, pv, plate_mask = generate_tectonic_map(w, h, params["plate_points"], ms)
         diagnostic_maps["0_plate_mask"] = plate_mask.copy()
         diagnostic_maps["1_tectonic_potential"] = tsm.copy()
@@ -800,7 +850,9 @@ def generate_world_data(params, scaling_manager):
         diagnostic_maps["2_tectonic_smoothed"] = tsm.copy()
         cm = generate_flow_field_landmass(w, h, params["continent_scale"], params["flow_distortion"], params["continent_octaves"], ms + 1)
         diagnostic_maps["3_continent_base"] = cm.copy()
-        rm = generate_ridged_multifractal_noise(w, h, params["ridge_scale"], params["ridge_octaves"], ms + 4)
+        # Use ridged multifractal noise with 40× the frequency of the continent base
+        ridge_scale = max(params["continent_scale"] / 40.0, 1e-3)
+        rm = generate_ridged_multifractal_noise(w, h, ridge_scale, params["ridge_octaves"], ms + 4)
         diagnostic_maps["4_mountain_ridges"] = rm.copy()
         bn = generate_perlin_noise(w, h, params["boundary_detail_scale"], 8, ms + 2)
         diagnostic_maps["5_boundary_noise"] = bn.copy()
